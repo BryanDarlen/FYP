@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # FYP
 =======
 # Predicting Air Pollution Levels in Malaysia Using Real-Time Web Data

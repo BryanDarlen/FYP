@@ -60,13 +60,28 @@
 #     FRP_MW_MAX        → strongest single fire that hour
 #     HIGH_CONF_COUNT   → only high-confidence detections (most reliable)
 #
+#   FROM NASA FIRMS (summarised per hour, STATION-LOCAL within LOCAL_RADIUS_KM):
+#     HOTSPOT_COUNT_100KM    → fires within 100 km of THIS station that hour
+#     FRP_MW_MEAN_100KM      → mean intensity of those nearby fires
+#     FRP_MW_MAX_100KM       → strongest nearby fire
+#     HIGH_CONF_COUNT_100KM  → high-confidence nearby detections only
+#   These give the model a geographically-relevant fire signal — a fire in
+#   Sabah no longer affects the feature value seen by a station in Selangor.
+#
 # =============================================================================
 
 import pandas as pd
+import numpy as np
 import requests
 import sys
 import os
 import io
+
+# Radius (km) within which a FIRMS hotspot is considered "local" to a station.
+# 100 km is a practical default — smoke from fires can travel further, but
+# the per-station signal weakens with distance. Adjust if you want a tighter
+# (e.g. 50 km) or wider (e.g. 200 km) station-local fire feature.
+LOCAL_RADIUS_KM = 100.0
 
 OUTPUT_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "outputs")
@@ -120,6 +135,8 @@ def select_met_columns(df: pd.DataFrame) -> pd.DataFrame:
 def select_firms_columns(df: pd.DataFrame) -> pd.DataFrame:
     keep = [
         "ACQ_DATETIME_MYT",
+        "LATITUDE",       # needed for station-local distance filter
+        "LONGITUDE",      # needed for station-local distance filter
         "FRP_MW",
         "CONFIDENCE",
     ]
@@ -159,6 +176,81 @@ def aggregate_firms_hourly(df: pd.DataFrame) -> pd.DataFrame:
     hourly["FRP_MW_MEAN"] = hourly["FRP_MW_MEAN"].round(2)
     hourly["FRP_MW_MAX"]  = hourly["FRP_MW_MAX"].round(2)
     return hourly
+
+
+# =============================================================================
+# STEP 3b — AGGREGATE NASA FIRMS PER STATION (station-local fire signal)
+# =============================================================================
+# The national HOTSPOT_COUNT above attaches the same value to every station,
+# so a fire in Sabah inflates the feature seen by a station in Selangor.
+# Here we count only the hotspots within LOCAL_RADIUS_KM of each station.
+#
+# Method:
+#   1. Cross-join FIRMS hotspots × APIMS stations (small: ~hundreds × 68)
+#   2. Compute great-circle (haversine) distance for each pair
+#   3. Keep only pairs within LOCAL_RADIUS_KM
+#   4. Group by (STATION_ID, HOUR_MYT) and aggregate
+
+def haversine_km(lat1, lon1, lat2, lon2) -> np.ndarray:
+    """Great-circle distance in km between two lat/lon points (vectorised)."""
+    R = 6371.0  # Earth radius in km
+    lat1_r = np.radians(lat1)
+    lat2_r = np.radians(lat2)
+    dlat   = np.radians(lat2 - lat1)
+    dlon   = np.radians(lon2 - lon1)
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1_r) * np.cos(lat2_r) * np.sin(dlon / 2) ** 2
+    return 2 * R * np.arcsin(np.sqrt(a))
+
+
+def aggregate_firms_per_station(
+    firms: pd.DataFrame,
+    stations: pd.DataFrame,
+    radius_km: float = LOCAL_RADIUS_KM,
+) -> pd.DataFrame:
+    """
+    Returns one row per (STATION_ID, HOUR_MYT) with hotspot counts/intensities
+    restricted to fires within `radius_km` of that specific station.
+
+    `stations` must have: STATION_ID, LATITUDE, LONGITUDE (one row per station).
+    `firms` must have: ACQ_DATETIME_MYT, LATITUDE, LONGITUDE, FRP_MW, CONFIDENCE.
+    """
+    cols_out = [
+        "STATION_ID", "HOUR_MYT",
+        "HOTSPOT_COUNT_100KM", "FRP_MW_MEAN_100KM",
+        "FRP_MW_MAX_100KM",   "HIGH_CONF_COUNT_100KM",
+    ]
+    if firms.empty or stations.empty:
+        return pd.DataFrame(columns=cols_out)
+
+    f = firms.copy()
+    f["HOUR_MYT"]     = round_to_hour(f["ACQ_DATETIME_MYT"])
+    f["IS_HIGH_CONF"] = f["CONFIDENCE"].astype(str).str.lower() == "h"
+
+    # Cross-join (Cartesian product). Cheap at this scale: ~hundreds × 68.
+    s = stations[["STATION_ID", "LATITUDE", "LONGITUDE"]].rename(
+        columns={"LATITUDE": "STATION_LAT", "LONGITUDE": "STATION_LON"}
+    )
+    pairs = f.merge(s, how="cross")
+
+    pairs["DIST_KM"] = haversine_km(
+        pairs["LATITUDE"].to_numpy(),  pairs["LONGITUDE"].to_numpy(),
+        pairs["STATION_LAT"].to_numpy(), pairs["STATION_LON"].to_numpy(),
+    )
+    pairs = pairs[pairs["DIST_KM"] <= radius_km]
+
+    if pairs.empty:
+        return pd.DataFrame(columns=cols_out)
+
+    agg = pairs.groupby(["STATION_ID", "HOUR_MYT"]).agg(
+        HOTSPOT_COUNT_100KM   =("FRP_MW",       "count"),
+        FRP_MW_MEAN_100KM     =("FRP_MW",       "mean"),
+        FRP_MW_MAX_100KM      =("FRP_MW",       "max"),
+        HIGH_CONF_COUNT_100KM =("IS_HIGH_CONF", "sum"),
+    ).reset_index()
+
+    agg["FRP_MW_MEAN_100KM"] = agg["FRP_MW_MEAN_100KM"].round(2)
+    agg["FRP_MW_MAX_100KM"]  = agg["FRP_MW_MAX_100KM"].round(2)
+    return agg
 
 
 # =============================================================================
@@ -204,8 +296,16 @@ def merge_all(
             "FRP_MW_MAX",
             "HIGH_CONF_COUNT"
         ])
+        firms_local = pd.DataFrame(columns=[
+            "STATION_ID", "HOUR_MYT",
+            "HOTSPOT_COUNT_100KM", "FRP_MW_MEAN_100KM",
+            "FRP_MW_MAX_100KM",   "HIGH_CONF_COUNT_100KM",
+        ])
     else:
         firms_hourly = aggregate_firms_hourly(firms)
+        # Build station-local fire summary using each station's lat/lon
+        stations = apims[["STATION_ID", "LATITUDE", "LONGITUDE"]].drop_duplicates()
+        firms_local = aggregate_firms_per_station(firms, stations, LOCAL_RADIUS_KM)
 
     merged = pd.merge(
         apims,
@@ -215,7 +315,8 @@ def merge_all(
     )
 
     # ── F) JOIN 2: merged ← FIRMS hourly summary (by HOUR only) ──────────────
-    # Every APIMS row for the same hour gets the same national fire summary
+    # Every APIMS row for the same hour gets the same national fire summary.
+    # This still has value for transboundary/regional haze episodes.
     merged = pd.merge(
         merged,
         firms_hourly,
@@ -223,8 +324,22 @@ def merge_all(
         how="left",
     )
 
+    # ── F2) JOIN 3: merged ← FIRMS station-local summary (by STATION + HOUR) ─
+    # Each station gets a fire count restricted to fires within LOCAL_RADIUS_KM
+    # of that specific station. This is the geographically-relevant signal.
+    merged = pd.merge(
+        merged,
+        firms_local,
+        on=["STATION_ID", "HOUR_MYT"],
+        how="left",
+    )
+
     # ── G) Fill missing FIRMS columns with 0 (no fires = 0 hotspots) ─────────
-    for col in ["HOTSPOT_COUNT", "FRP_MW_MEAN", "FRP_MW_MAX", "HIGH_CONF_COUNT"]:
+    for col in [
+        "HOTSPOT_COUNT", "FRP_MW_MEAN", "FRP_MW_MAX", "HIGH_CONF_COUNT",
+        "HOTSPOT_COUNT_100KM", "FRP_MW_MEAN_100KM",
+        "FRP_MW_MAX_100KM",   "HIGH_CONF_COUNT_100KM",
+    ]:
         if col in merged.columns:
             merged[col] = merged[col].fillna(0)
 
@@ -369,12 +484,16 @@ def validate_snapshot(df: pd.DataFrame) -> pd.DataFrame:
             logger.warning(f"[VALIDATE] {mask_temp.sum()} rows with TEMPERATURE_C > 50")
             df.loc[mask_temp, "DATA_FLAG"] += "INVALID_TEMP;"
 
-    # Negative hotspot count
-    if "HOTSPOT_COUNT" in df.columns:
-        mask_hs = df["HOTSPOT_COUNT"] < 0
-        if mask_hs.any():
-            logger.warning(f"[VALIDATE] {mask_hs.sum()} rows with negative HOTSPOT_COUNT")
-            df.loc[mask_hs, "DATA_FLAG"] += "INVALID_HOTSPOT;"
+    # Negative hotspot count (national or station-local)
+    for hs_col, flag_tag in [
+        ("HOTSPOT_COUNT",       "INVALID_HOTSPOT;"),
+        ("HOTSPOT_COUNT_100KM", "INVALID_HOTSPOT_LOCAL;"),
+    ]:
+        if hs_col in df.columns:
+            mask_hs = df[hs_col] < 0
+            if mask_hs.any():
+                logger.warning(f"[VALIDATE] {mask_hs.sum()} rows with negative {hs_col}")
+                df.loc[mask_hs, "DATA_FLAG"] += flag_tag
 
     flagged = (df["DATA_FLAG"] != "").sum()
     if flagged:

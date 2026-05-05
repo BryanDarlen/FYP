@@ -37,7 +37,13 @@
 - [ ] Add a data validation step: flag impossible values (API < 0, temperature > 50°C), sudden flatlines (same API reading for 6+ consecutive hours), and large spikes (API jump > 50 in one hour).
 
 **Output:** A CSV/SQLite table with columns:
-`STATION_ID, STATION_LOCATION, STATE_NAME, LAT, LON, HOUR_MYT, API, CLASS, TEMPERATURE_C, RAIN_FORECAST_SLOTS, HOTSPOT_COUNT, FRP_MW_MEAN, FRP_MW_MAX, HIGH_CONF_COUNT`
+`STATION_ID, STATION_LOCATION, STATE_NAME, LAT, LON, HOUR_MYT, API, CLASS, TEMPERATURE_C, RAIN_FORECAST_SLOTS, HOTSPOT_COUNT, FRP_MW_MEAN, FRP_MW_MAX, HIGH_CONF_COUNT, HOTSPOT_COUNT_100KM, FRP_MW_MEAN_100KM, FRP_MW_MAX_100KM, HIGH_CONF_COUNT_100KM`
+
+> **Note on FIRMS columns.** Two granularities are kept:
+> - The original four columns (`HOTSPOT_COUNT`, `FRP_MW_MEAN`, `FRP_MW_MAX`, `HIGH_CONF_COUNT`) are a **national** hourly summary — the same value is attached to every station for that hour. Useful for transboundary haze episodes (e.g. fires in Sumatra/Riau driving haze across the whole country).
+> - The four `_100KM` columns are **station-local**: only fires within 100 km of the specific station, computed via great-circle distance between FIRMS hotspot lat/lon and the station's lat/lon. Useful for direct local fire impact and for cleaner SHAP explanations on the dashboard.
+>
+> The 100 km radius is an engineering choice, not a published standard — there is no fixed buffer in the FIRMS documentation. It is justified by the established finding that wildfire smoke degrades PM2.5 in downwind areas "tens to hundreds of kilometers" from the source. Adjustable via the `LOCAL_RADIUS_KM` constant in `pipeline_merge.py`.
 
 ---
 
@@ -48,7 +54,7 @@
 - [ ] Create **lag features** per station: `API_lag1h`, `API_lag2h`, `API_lag3h`, `API_lag6h`, `API_lag12h`, `API_lag24h`
 - [ ] Create **rolling averages**: `API_roll3h`, `API_roll6h`, `API_roll12h` (these also serve the "episode shape" chart toggle in the UI)
 - [ ] Create **time features**: `HOUR_OF_DAY`, `DAY_OF_WEEK`, `IS_WEEKEND`
-- [ ] Create **fire-weather interaction**: `FIRE_AND_DRY` = 1 if `HOTSPOT_COUNT > 0` AND `RAIN_FORECAST_SLOTS == 0`
+- [ ] Create **fire-weather interaction**: `FIRE_AND_DRY` = 1 if `HOTSPOT_COUNT_100KM > 0` AND `RAIN_FORECAST_SLOTS == 0` (use the station-local hotspot count so the feature reflects fires that can plausibly affect *this* station, not fires anywhere in Malaysia)
 - [ ] Handle missing values: forward-fill gaps up to 2 hours; if gap > 2 hours, mark as `DATA_MISSING = 1`
 
 **Output:** Enriched dataset ready for model training, saved as `data/processed/features.csv`

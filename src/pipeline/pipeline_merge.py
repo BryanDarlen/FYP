@@ -1,0 +1,474 @@
+# =============================================================================
+# FYP: Predicting Air Pollution Levels in Malaysia Using Real Time Web Data
+# Chapter 3.4 – Data Preparation: Combining APIMS + METMalaysia + NASA FIRMS
+# Author : Bryan Quinn Darlen | TP073947
+# =============================================================================
+#
+# HOW THIS FILE CONNECTS TO YOUR 3 FILES:
+# -----------------------------------------
+#   apimstrsfmvslztn.py     → provides preprocess_apims()
+#                             uses requests (sync) — fetched directly here
+#
+#   metmalaysiatrsfmvslztn.py → provides fetch_met_data() + preprocess_met()
+#                               uses httpx (async)
+#
+#   firmstrsfmvslztn.py     → provides fetch_firms_data() + preprocess_firms()
+#                             uses httpx (async)
+#
+# ALL 3 FILES MUST BE IN THE SAME FOLDER AS THIS FILE.
+#
+# =============================================================================
+#
+# WHAT THIS FILE DOES (Plain English):
+# -------------------------------------
+# We have 3 separate cleaned datasets:
+#   - APIMS        → tells us AIR QUALITY (API) at each station per hour
+#   - METMalaysia  → tells us WEATHER (temperature, rain) at each state
+#   - NASA FIRMS   → tells us WHERE and HOW INTENSE fires are burning
+#
+# The goal is to combine all 3 into ONE table so that every APIMS reading
+# also has the weather and fire information for the same time and place.
+# This combined table is what the forecast model will train on.
+#
+# MERGE STRATEGY:
+# ----------------
+#   Step A → Round all 3 datasets to the same 1-hour time slot
+#   Step B → Join APIMS + METMalaysia by matching STATE + HOUR
+#   Step C → Aggregate FIRMS hotspots per hour, attach to every row
+#
+# COLUMNS SELECTED AND WHY:
+# --------------------------
+#   FROM APIMS:
+#     STATION_ID        → identifies which monitoring station
+#     STATION_LOCATION  → human-readable station name
+#     STATE_NAME        → ← JOIN KEY with METMalaysia
+#     LATITUDE          → station coordinates
+#     LONGITUDE         → station coordinates
+#     DATETIME          → ← TIME JOIN KEY (rounded to hour)
+#     API               → ⭐ TARGET — the value the model will predict
+#     CLASS             → Good / Moderate / Unhealthy label
+#
+#   FROM METMalaysia:
+#     STATE             → ← JOIN KEY with APIMS STATE_NAME
+#     DATETIME_MYT      → ← TIME JOIN KEY (rounded to hour)
+#     TEMPERATURE_C     → temperature affects how pollutants disperse
+#     RAIN_FORECAST_SLOTS → rain washes out PM2.5, directly lowers API
+#
+#   FROM NASA FIRMS (summarised per hour, national level):
+#     HOTSPOT_COUNT     → total fires detected in Malaysia that hour
+#     FRP_MW_MEAN       → average fire intensity — higher = more smoke
+#     FRP_MW_MAX        → strongest single fire that hour
+#     HIGH_CONF_COUNT   → only high-confidence detections (most reliable)
+#
+# =============================================================================
+
+import pandas as pd
+import requests
+import sys
+import os
+import io
+
+OUTPUT_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "outputs")
+)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fetch_apims import preprocess_apims
+from fetch_metmalaysia import fetch_met_data, preprocess_met
+from fetch_firms import fetch_firms_data, preprocess_firms
+
+# APIMS endpoint — fetched with requests (sync) directly in this file
+APIMS_URL = (
+    "https://eqms.doe.gov.my/api3/publicmapproxy/PUBLIC_DISPLAY"
+    "/CAQM_MCAQM_Current_Reading/MapServer/0/query"
+    "?f=json&outFields=*&returnGeometry=false"
+    "&spatialRel=esriSpatialRelIntersects&where=1%3D1"
+)
+
+
+# =============================================================================
+# STEP 1 — SELECT COLUMNS FROM EACH DATASET
+# =============================================================================
+# Only keep the columns that are useful for forecasting.
+# Everything else is dropped to keep the merged table clean.
+
+def select_apims_columns(df: pd.DataFrame) -> pd.DataFrame:
+    keep = [
+        "STATION_ID",        
+        "STATION_LOCATION",  
+        "STATE_NAME",        
+        "LATITUDE",
+        "LONGITUDE",
+        "DATETIME",          
+        "API",              
+        "CLASS",             
+    ]
+    return df[[c for c in keep if c in df.columns]].copy()
+
+
+def select_met_columns(df: pd.DataFrame) -> pd.DataFrame:
+    keep = [
+        "STATE",
+        "DATETIME_MYT",   
+        "TEMPERATURE_C",   
+        "RAIN_FORECAST_SLOTS",
+    ]
+    return df[[c for c in keep if c in df.columns]].copy()
+
+
+def select_firms_columns(df: pd.DataFrame) -> pd.DataFrame:
+    keep = [
+        "ACQ_DATETIME_MYT",
+        "FRP_MW",
+        "CONFIDENCE",
+    ]
+    return df[[c for c in keep if c in df.columns]].copy()
+
+
+# =============================================================================
+# STEP 2 — ROUND ALL TIMESTAMPS TO THE NEAREST HOUR
+# =============================================================================
+# APIMS is hourly. METMalaysia is a snapshot. FIRMS has satellite pass times.
+# We floor all of them to the same hour so the join keys match.
+# Example: 14:47 → 14:00,  14:32 → 14:00,  both match correctly.
+
+def round_to_hour(dt_series: pd.Series) -> pd.Series:
+    return pd.to_datetime(dt_series).dt.floor("h")
+
+
+# =============================================================================
+# STEP 3 — AGGREGATE NASA FIRMS TO ONE ROW PER HOUR
+# =============================================================================
+# FIRMS gives one row per hotspot. We collapse all hotspots detected in
+# the same hour into one summary row, then attach it to every APIMS row
+# for that hour. This is called a "national-level" fire summary.
+
+def aggregate_firms_hourly(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["HOUR_MYT"]    = round_to_hour(df["ACQ_DATETIME_MYT"])
+    df["IS_HIGH_CONF"] = df["CONFIDENCE"].astype(str).str.lower() == "h"
+
+    hourly = df.groupby("HOUR_MYT").agg(
+        HOTSPOT_COUNT   =("FRP_MW",        "count"),
+        FRP_MW_MEAN     =("FRP_MW",        "mean"),
+        FRP_MW_MAX      =("FRP_MW",        "max"),
+        HIGH_CONF_COUNT =("IS_HIGH_CONF",  "sum"),
+    ).reset_index()
+
+    hourly["FRP_MW_MEAN"] = hourly["FRP_MW_MEAN"].round(2)
+    hourly["FRP_MW_MAX"]  = hourly["FRP_MW_MAX"].round(2)
+    return hourly
+
+
+# =============================================================================
+# STEP 4 — CLEAN STATE NAMES SO THE JOIN WORKS
+# =============================================================================
+# APIMS might say "W.P. Kuala Lumpur", METMalaysia might say "Kuala Lumpur".
+# We clean both to lowercase + remove common prefixes so they match.
+
+def clean_state(s: str) -> str:
+    s = str(s).lower().strip()
+    for prefix in ["w.p. ", "w.p.", "wilayah persekutuan ", "wp "]:
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+    return s.strip()
+
+
+# =============================================================================
+# STEP 5 — MERGE ALL THREE DATASETS INTO ONE TABLE
+# =============================================================================
+
+def merge_all(
+    df_apims: pd.DataFrame,
+    df_met:   pd.DataFrame,
+    df_firms: pd.DataFrame,
+) -> pd.DataFrame:
+
+    apims = select_apims_columns(df_apims)
+    met   = select_met_columns(df_met)
+    firms = select_firms_columns(df_firms)
+
+    # Bug 1 fix — remove MYT_OFFSET, APIMS datetime is already MYT
+    apims["HOUR_MYT"] = round_to_hour(apims["DATETIME"])
+    met["HOUR_MYT"]   = round_to_hour(met["DATETIME_MYT"])
+
+    apims["STATE_CLEAN"] = apims["STATE_NAME"].apply(clean_state)
+    met["STATE_CLEAN"]   = met["STATE"].apply(clean_state)
+
+    if firms.empty:
+        firms_hourly = pd.DataFrame(columns=[
+            "HOUR_MYT",
+            "HOTSPOT_COUNT",
+            "FRP_MW_MEAN",
+            "FRP_MW_MAX",
+            "HIGH_CONF_COUNT"
+        ])
+    else:
+        firms_hourly = aggregate_firms_hourly(firms)
+
+    merged = pd.merge(
+        apims,
+        met.drop(columns=["STATE", "DATETIME_MYT"], errors="ignore"),
+        on=["STATE_CLEAN", "HOUR_MYT"],
+        how="left",
+    )
+
+    # ── F) JOIN 2: merged ← FIRMS hourly summary (by HOUR only) ──────────────
+    # Every APIMS row for the same hour gets the same national fire summary
+    merged = pd.merge(
+        merged,
+        firms_hourly,
+        on="HOUR_MYT",
+        how="left",
+    )
+
+    # ── G) Fill missing FIRMS columns with 0 (no fires = 0 hotspots) ─────────
+    for col in ["HOTSPOT_COUNT", "FRP_MW_MEAN", "FRP_MW_MAX", "HIGH_CONF_COUNT"]:
+        if col in merged.columns:
+            merged[col] = merged[col].fillna(0)
+
+    # ── H) Drop helper columns no longer needed ───────────────────────────────
+    merged.drop(columns=["STATE_CLEAN", "DATETIME"], inplace=True, errors="ignore")
+
+    # ── I) Sort and reset index ────────────────────────────────────────────────
+    merged.sort_values(["STATION_ID", "HOUR_MYT"], inplace=True)
+    merged.reset_index(drop=True, inplace=True)
+
+    return merged
+
+
+# =============================================================================
+# STEP 6 — DATA UNDERSTANDING: MERGED DATASET
+# =============================================================================
+
+def understand_merged(df: pd.DataFrame) -> None:
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", None)
+    pd.set_option("display.max_rows", None)
+
+    output = io.StringIO()
+
+    def p(text=""):
+        print(text, file=output)
+
+    p("=== Merged Dataset ===")
+    p(f"Rows: {df.shape[0]}  Cols: {df.shape[1]}")
+    p(df.head(5).to_string())
+    p("\n=== [DESCRIBE] ===")
+    p(df.describe(include="all").to_string())
+    p("\n=== [UNIQUE VALUE COUNT] ===")
+    p(df.nunique(dropna=False).sort_values(ascending=False).to_string())
+    p("\n=== [MISSING VALUES] ===")
+    missing = df.isnull().sum()
+    missing = missing[missing > 0]
+    p("  No missing values." if missing.empty else missing.to_string())
+    p("\n=== [FINAL COLUMNS] ===")
+    for i, col in enumerate(df.columns, 1):
+        p(f"  {i:>2}. {col}")
+
+    out_path = os.path.join(OUTPUT_DIR, "merged_understand.txt")
+    with open(out_path, "w") as f:
+        f.write(output.getvalue())
+    print(f"[Saved: {out_path}]")
+
+
+# =============================================================================
+# STEP 7 — DATA VISUALIZATION: MERGED DATASET
+# =============================================================================
+# Produces 3 plots to understand the merged dataset:
+#
+#   Plot 1 — Bar Chart: Average API per State
+#             Shows which states consistently have the highest API.
+#             This is the most important chart since API is the target.
+#
+#   Plot 2 — Scatter Plot: Temperature vs API
+#             Shows whether hotter temperatures are linked to higher API.
+#             If yes, temperature is a strong feature for the model.
+#
+#   Plot 3 — Scatter Plot: Hotspot Count vs API
+#             Shows whether more fires are linked to higher API readings.
+#             This is the key relationship the FYP is trying to capture.
+
+def visualize_merged(df: pd.DataFrame) -> None:
+    """Generates 3 visualizations for the final merged DataFrame."""
+
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle("Merged Dataset (APIMS + METMalaysia + NASA FIRMS) — Visualization",
+                 fontsize=13, fontweight="bold", y=1.01)
+
+    # ── Plot 1: Average API per State ─────────────────────────────────────────
+    ax1 = axes[0]
+    if "API" in df.columns and "STATE_NAME" in df.columns:
+        avg_api = df.groupby("STATE_NAME")["API"].mean().sort_values(ascending=True)
+        bars = ax1.barh(avg_api.index, avg_api.values,
+                        color="#E53935", edgecolor="white", linewidth=0.7)
+        ax1.bar_label(bars, fmt="%.1f", padding=3, fontsize=7)
+        ax1.axvline(avg_api.mean(), color="#212121", linestyle="--", linewidth=1.2,
+                    label=f"Overall Mean: {avg_api.mean():.1f}")
+        ax1.set_title("Average API per State", fontsize=12, fontweight="bold")
+        ax1.set_xlabel("Average API")
+        ax1.set_ylabel("State")
+        ax1.legend(fontsize=8)
+
+    # ── Plot 2: Temperature vs API ────────────────────────────────────────────
+    ax2 = axes[1]
+    if "TEMPERATURE_C" in df.columns and "API" in df.columns:
+        plot_df = df[["TEMPERATURE_C", "API"]].dropna()
+        ax2.scatter(plot_df["TEMPERATURE_C"], plot_df["API"],
+                    alpha=0.4, color="#1E88E5", edgecolors="none", s=25)
+        ax2.set_title("Temperature vs API", fontsize=12, fontweight="bold")
+        ax2.set_xlabel("Temperature (°C)")
+        ax2.set_ylabel("API")
+        ax2.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+
+    # ── Plot 3: Fire Hotspot Count vs API ─────────────────────────────────────
+    ax3 = axes[2]
+    if "HOTSPOT_COUNT" in df.columns and "API" in df.columns:
+        plot_df = df[["HOTSPOT_COUNT", "API"]].dropna()
+        ax3.scatter(plot_df["HOTSPOT_COUNT"], plot_df["API"],
+                    alpha=0.4, color="#FB8C00", edgecolors="none", s=25)
+        ax3.set_title("Fire Hotspot Count vs API", fontsize=12, fontweight="bold")
+        ax3.set_xlabel("Number of Hotspots (National, per Hour)")
+        ax3.set_ylabel("API")
+        ax3.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+
+    plt.tight_layout()
+    out_path = os.path.join(OUTPUT_DIR, "merged_visualization.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"\n[Visualization saved: {out_path}]")
+    plt.show()
+
+
+# =============================================================================
+# STEP 8 — DATA VALIDATION
+# =============================================================================
+# Checks each snapshot for impossible or suspicious values before saving.
+# Rows are NOT dropped — they are flagged so bad data is visible in the dataset.
+
+def validate_snapshot(df: pd.DataFrame) -> pd.DataFrame:
+    import logging
+    logger = logging.getLogger("pipeline")
+
+    df = df.copy()
+    df["DATA_FLAG"] = ""
+
+    # Impossible API values
+    mask_api = df["API"].notna() & ((df["API"] < 0) | (df["API"] > 500))
+    if mask_api.any():
+        logger.warning(f"[VALIDATE] {mask_api.sum()} rows with impossible API value")
+        df.loc[mask_api, "DATA_FLAG"] += "INVALID_API;"
+
+    # Impossible temperature
+    if "TEMPERATURE_C" in df.columns:
+        mask_temp = df["TEMPERATURE_C"].notna() & (df["TEMPERATURE_C"] > 50)
+        if mask_temp.any():
+            logger.warning(f"[VALIDATE] {mask_temp.sum()} rows with TEMPERATURE_C > 50")
+            df.loc[mask_temp, "DATA_FLAG"] += "INVALID_TEMP;"
+
+    # Negative hotspot count
+    if "HOTSPOT_COUNT" in df.columns:
+        mask_hs = df["HOTSPOT_COUNT"] < 0
+        if mask_hs.any():
+            logger.warning(f"[VALIDATE] {mask_hs.sum()} rows with negative HOTSPOT_COUNT")
+            df.loc[mask_hs, "DATA_FLAG"] += "INVALID_HOTSPOT;"
+
+    flagged = (df["DATA_FLAG"] != "").sum()
+    if flagged:
+        logger.warning(f"[VALIDATE] Total flagged rows this snapshot: {flagged}")
+    else:
+        logger.info("[VALIDATE] All rows passed validation.")
+
+    return df
+
+
+# =============================================================================
+# STEP 9 — APPEND SNAPSHOT TO TIMESERIES CSV
+# =============================================================================
+# Each hourly run appends its rows to merged_timeseries.csv.
+# Duplicates (same STATION_ID + HOUR_MYT) are dropped so re-runs are safe.
+
+TIMESERIES_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "..", "data", "processed", "merged_timeseries.csv"
+)
+
+
+def save_snapshot(df: pd.DataFrame) -> None:
+    import logging
+    logger = logging.getLogger("pipeline")
+
+    out_path = os.path.normpath(TIMESERIES_PATH)
+
+    if os.path.exists(out_path):
+        existing = pd.read_csv(out_path, parse_dates=["HOUR_MYT"])
+        combined = pd.concat([existing, df], ignore_index=True)
+    else:
+        combined = df.copy()
+
+    before = len(combined)
+    combined.drop_duplicates(subset=["STATION_ID", "HOUR_MYT"], keep="last", inplace=True)
+    combined.sort_values(["STATION_ID", "HOUR_MYT"], inplace=True)
+    combined.reset_index(drop=True, inplace=True)
+    after = len(combined)
+
+    combined.to_csv(out_path, index=False)
+    logger.info(
+        f"[SAVE] Snapshot appended → {out_path} "
+        f"| new rows: {len(df)} | deduped: {before - after} | total: {after}"
+    )
+    print(f"[SAVE] merged_timeseries.csv now has {after} rows.")
+
+
+# =============================================================================
+# ── QUICK TEST (run directly: python data_pipeline_merge.py) ─────────────────
+# =============================================================================
+
+if __name__ == "__main__":
+    import asyncio
+    import traceback
+
+    async def run_test():
+        print("\n" + "=" * 65)
+        print("  Merge Pipeline — Fetch + Combine Test")
+        print("=" * 65)
+        try:
+            # ── APIMS: uses requests (sync) ───────────────────────────────────
+            print("[1/4] Fetching APIMS...")
+            raw_apims  = requests.get(APIMS_URL, timeout=60)
+            raw_apims.raise_for_status()
+            df_apims   = preprocess_apims(raw_apims.json())
+
+            # ── METMalaysia: uses httpx (async) ──────────────────────────────
+            print("[2/4] Fetching METMalaysia...")
+            raw_met  = await fetch_met_data()
+            df_met   = preprocess_met(raw_met)
+
+            # ── NASA FIRMS: uses httpx (async) ────────────────────────────────
+            print("[3/4] Fetching NASA FIRMS...")
+            raw_firms = await fetch_firms_data()
+            df_firms  = preprocess_firms(raw_firms)
+            
+            # ── Merge all 3 ───────────────────────────────────────────────────
+            print("[4/4] Merging all 3 datasets...\n")
+            df_merged = merge_all(df_apims, df_met, df_firms)
+
+            understand_merged(df_merged)
+            visualize_merged(df_merged)
+
+        except Exception as e:
+            print(f"\n  ERROR: {e}")
+            traceback.print_exc()
+
+    # Works in both terminal and Jupyter / VS Code Interactive
+    try:
+        asyncio.run(run_test())
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(run_test())
+
+    async def save_snapshot(df):
+        print(hi)

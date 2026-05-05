@@ -1,0 +1,57 @@
+=== Merged Dataset ===
+Rows: 68  Cols: 14
+  STATION_ID      STATION_LOCATION STATE_NAME  LATITUDE   LONGITUDE   API     CLASS            HOUR_MYT  TEMPERATURE_C  RAIN_FORECAST_SLOTS  HOTSPOT_COUNT  FRP_MW_MEAN  FRP_MW_MAX  HIGH_CONF_COUNT
+0      CA01R        Kangar, PERLIS     Perlis  6.429928  100.210937  59.0  Moderate 2026-04-29 14:00:00             34                    7              0            0           0                0
+1      CA02K       Langkawi, KEDAH      Kedah  6.331608   99.858461  53.0  Moderate 2026-04-29 14:00:00             35                   10              0            0           0                0
+2      CA03K     Alor Setar, KEDAH      Kedah  6.137130  100.346857  60.0  Moderate 2026-04-29 14:00:00             35                   10              0            0           0                0
+3      CA04K  Sungai Petani, KEDAH      Kedah  5.629709  100.467710  60.0  Moderate 2026-04-29 14:00:00             35                   10              0            0           0                0
+4      CA05K  Kulim Hi-Tech, KEDAH      Kedah  5.401634  100.589653  57.0  Moderate 2026-04-29 14:00:00             35                   10              0            0           0                0
+
+=== [DESCRIBE] ===
+       STATION_ID STATION_LOCATION STATE_NAME   LATITUDE   LONGITUDE        API     CLASS             HOUR_MYT  TEMPERATURE_C  RAIN_FORECAST_SLOTS  HOTSPOT_COUNT  FRP_MW_MEAN  FRP_MW_MAX  HIGH_CONF_COUNT
+count          68               68         68  68.000000   68.000000  68.000000        68                   68      68.000000            68.000000           68.0         68.0        68.0             68.0
+unique         68               68         16        NaN         NaN        NaN         2                  NaN            NaN                  NaN            NaN          NaN         NaN              NaN
+top         CA01R   Kangar, PERLIS    Sarawak        NaN         NaN        NaN  Moderate                  NaN            NaN                  NaN            NaN          NaN         NaN              NaN
+freq            1                1         13        NaN         NaN        NaN        39                  NaN            NaN                  NaN            NaN          NaN         NaN              NaN
+mean          NaN              NaN        NaN   3.733189  105.438130  50.161765       NaN  2026-04-29 14:00:00      33.088235             3.558824            0.0          0.0         0.0              0.0
+min           NaN              NaN        NaN   1.172556   99.858461  30.000000       NaN  2026-04-29 14:00:00      31.000000             0.000000            0.0          0.0         0.0              0.0
+25%           NaN              NaN        NaN   2.423726  101.548255  40.750000       NaN  2026-04-29 14:00:00      32.000000             0.000000            0.0          0.0         0.0              0.0
+50%           NaN              NaN        NaN   3.501764  102.542395  53.000000       NaN  2026-04-29 14:00:00      34.000000             3.000000            0.0          0.0         0.0              0.0
+75%           NaN              NaN        NaN   5.313463  110.792341  59.000000       NaN  2026-04-29 14:00:00      34.000000             7.000000            0.0          0.0         0.0              0.0
+max           NaN              NaN        NaN   6.429928  118.091062  70.000000       NaN  2026-04-29 14:00:00      35.000000            11.000000            0.0          0.0         0.0              0.0
+std           NaN              NaN        NaN   1.542865    5.680700  10.257302       NaN                  NaN       1.289861             4.031156            0.0          0.0         0.0              0.0
+
+=== [UNIQUE VALUE COUNT] ===
+STATION_ID             68
+STATION_LOCATION       68
+LATITUDE               68
+LONGITUDE              68
+API                    30
+STATE_NAME             16
+RAIN_FORECAST_SLOTS     8
+TEMPERATURE_C           5
+CLASS                   2
+HOUR_MYT                1
+HOTSPOT_COUNT           1
+FRP_MW_MEAN             1
+FRP_MW_MAX              1
+HIGH_CONF_COUNT         1
+
+=== [MISSING VALUES] ===
+  No missing values.
+
+=== [FINAL COLUMNS] ===
+   1. STATION_ID
+   2. STATION_LOCATION
+   3. STATE_NAME
+   4. LATITUDE
+   5. LONGITUDE
+   6. API
+   7. CLASS
+   8. HOUR_MYT
+   9. TEMPERATURE_C
+  10. RAIN_FORECAST_SLOTS
+  11. HOTSPOT_COUNT
+  12. FRP_MW_MEAN
+  13. FRP_MW_MAX
+  14. HIGH_CONF_COUNT

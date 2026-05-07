@@ -14,6 +14,7 @@ import os
 import httpx
 import pandas as pd
 from fastapi import FastAPI
+from typing import Optional
 
 OUTPUT_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "outputs")
@@ -29,6 +30,19 @@ from datetime import datetime, timezone, timedelta
 
 # METMalaysia – current weather readings (JSON, updated to latest, UTC timestamps)
 MET_URL = "https://www.met.gov.my/json/cuaca_semasa/data.json"
+
+WIS2_SYNOPTIC_URL = (
+    "https://wis2node.met.gov.my/oapi/collections/"
+    "urn%3Awmo%3Amd%3Amy-metmalaysia%3Asynop-hourly/items"
+)
+WIS2_HISTORY_VARIABLES = (
+    "air_temperature",
+    "present_weather",
+    "past_weather1",
+    "past_weather2",
+)
+WIS2_PAGE_LIMIT = 10000
+WIS2_VERIFY_SSL = False
 
 # Malaysia Time offset (UTC+8) — used to align all timestamps to MYT
 MYT_OFFSET = timedelta(hours=8)
@@ -136,6 +150,162 @@ def preprocess_met(raw_json) -> pd.DataFrame:
     df.reset_index(drop=True, inplace=True)
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# SECTION 5b - PREPROCESS WIS2 SYNOP HISTORY
+# ---------------------------------------------------------------------------
+# The public METMalaysia data.json endpoint is current-only. The WIS2
+# synop-hourly endpoint is a different station-observation product that can
+# provide historical readings, so this helper prepares a clearly flagged
+# backfill/preview table without changing the scheduler's live behaviour.
+
+def _myt_to_utc_iso(value) -> str:
+    """Convert a MYT timestamp into an ISO UTC string accepted by WIS2."""
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        dt = ts.to_pydatetime().replace(tzinfo=timezone(MYT_OFFSET))
+    else:
+        dt = ts.to_pydatetime()
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def fetch_wis2_history(
+    start_datetime_myt,
+    end_datetime_myt,
+    variable_names: Optional[tuple[str, ...]] = None,
+) -> list[dict]:
+    """
+    Fetch historical WIS2 SYNOP observation features.
+
+    The date inputs are Malaysia Time (MYT). WIS2 expects UTC intervals, so the
+    function converts them before requesting the OGC API. SSL verification is
+    disabled for this endpoint because the local Python certificate store can
+    fail to validate wis2node.met.gov.my even when the endpoint is reachable.
+    """
+    names = variable_names or WIS2_HISTORY_VARIABLES
+    datetime_range = f"{_myt_to_utc_iso(start_datetime_myt)}/{_myt_to_utc_iso(end_datetime_myt)}"
+    features: list[dict] = []
+
+    async with httpx.AsyncClient(
+        timeout=30,
+        verify=WIS2_VERIFY_SSL,
+        follow_redirects=True,
+    ) as client:
+        for name in names:
+            url = WIS2_SYNOPTIC_URL
+            params = {
+                "f": "json",
+                "limit": WIS2_PAGE_LIMIT,
+                "datetime": datetime_range,
+                "name": name,
+            }
+
+            while url:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                payload = response.json()
+                features.extend(payload.get("features", []))
+
+                next_url = None
+                for link in payload.get("links", []):
+                    if link.get("rel") == "next" and link.get("href"):
+                        next_url = link["href"]
+                        break
+
+                url = next_url
+                params = None
+
+    return features
+
+
+def _description_has_rain(description) -> bool:
+    text = str(description or "").lower()
+    rain_terms = ("rain", "drizzle", "shower", "thunderstorm")
+    return any(term in text for term in rain_terms)
+
+
+def preprocess_wis2(raw_features: list[dict]) -> pd.DataFrame:
+    """
+    Convert WIS2 observation features into station-hour weather rows.
+
+    Output columns intentionally mirror the fields needed by the merge:
+    WIGOS_STATION_ID, coordinates, HOUR_MYT, TEMPERATURE_C, and
+    RAIN_FORECAST_SLOTS. For WIS2 this rain column is an observed/derived count
+    from present/past weather descriptions, not the forecast-slot dictionary
+    used by the current data.json endpoint.
+    """
+    out_cols = [
+        "WIGOS_STATION_ID", "DATETIME_UTC", "DATETIME_MYT", "HOUR_MYT",
+        "LATITUDE", "LONGITUDE", "TEMPERATURE_C", "RAIN_FORECAST_SLOTS",
+        "MET_SOURCE",
+    ]
+    rows = []
+
+    for feature in raw_features or []:
+        props = feature.get("properties", {}) or {}
+        geometry = feature.get("geometry", {}) or {}
+        coords = geometry.get("coordinates") or []
+        lon = coords[0] if len(coords) >= 1 else None
+        lat = coords[1] if len(coords) >= 2 else None
+
+        rows.append({
+            "WIGOS_STATION_ID": props.get("wigos_station_identifier"),
+            "DATETIME_UTC": props.get("reportTime"),
+            "VARIABLE": props.get("name"),
+            "VALUE": props.get("value"),
+            "DESCRIPTION": props.get("description"),
+            "LATITUDE": lat,
+            "LONGITUDE": lon,
+        })
+
+    long_df = pd.DataFrame(rows)
+    if long_df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    long_df["DATETIME_UTC"] = pd.to_datetime(long_df["DATETIME_UTC"], utc=True, errors="coerce")
+    long_df["DATETIME_MYT"] = (long_df["DATETIME_UTC"] + pd.Timedelta(hours=8)).dt.tz_localize(None)
+    long_df["HOUR_MYT"] = long_df["DATETIME_MYT"].dt.floor("h")
+    long_df["VALUE"] = pd.to_numeric(long_df["VALUE"], errors="coerce")
+    long_df["LATITUDE"] = pd.to_numeric(long_df["LATITUDE"], errors="coerce")
+    long_df["LONGITUDE"] = pd.to_numeric(long_df["LONGITUDE"], errors="coerce")
+
+    key_cols = ["WIGOS_STATION_ID", "HOUR_MYT"]
+    coords = (
+        long_df.dropna(subset=["WIGOS_STATION_ID", "HOUR_MYT", "LATITUDE", "LONGITUDE"])
+        .sort_values(key_cols)
+        .drop_duplicates(subset=key_cols)
+        [key_cols + ["DATETIME_UTC", "DATETIME_MYT", "LATITUDE", "LONGITUDE"]]
+    )
+
+    temp = (
+        long_df[long_df["VARIABLE"] == "air_temperature"]
+        .dropna(subset=["WIGOS_STATION_ID", "HOUR_MYT"])
+        .sort_values(key_cols)
+        .drop_duplicates(subset=key_cols, keep="last")
+        [key_cols + ["VALUE"]]
+        .rename(columns={"VALUE": "TEMPERATURE_C"})
+    )
+
+    weather_vars = ["present_weather", "past_weather1", "past_weather2"]
+    weather = long_df[long_df["VARIABLE"].isin(weather_vars)].copy()
+    if weather.empty:
+        rain = temp[key_cols].copy()
+        rain["RAIN_FORECAST_SLOTS"] = 0
+    else:
+        weather["RAIN_OBSERVED"] = weather["DESCRIPTION"].apply(_description_has_rain).astype(int)
+        rain = (
+            weather.groupby(key_cols, as_index=False)["RAIN_OBSERVED"]
+            .sum()
+            .rename(columns={"RAIN_OBSERVED": "RAIN_FORECAST_SLOTS"})
+        )
+
+    met = coords.merge(temp, on=key_cols, how="left")
+    met = met.merge(rain, on=key_cols, how="left")
+    met["RAIN_FORECAST_SLOTS"] = met["RAIN_FORECAST_SLOTS"].fillna(0).astype(int)
+    met["MET_SOURCE"] = "WIS2_SYNOP_HOURLY"
+    met = met.dropna(subset=["TEMPERATURE_C"])
+    return met[out_cols].sort_values(["WIGOS_STATION_ID", "HOUR_MYT"]).reset_index(drop=True)
 
 # ---------------------------------------------------------------------------
 # SECTION 6 — DATA UNDERSTANDING: METMalaysia

@@ -176,6 +176,34 @@ Project cleanup completed on 2026-05-07:
 - Updated `.gitignore` to keep runtime logs, generated model artefacts, and test backup folders out of git noise.
 - Left `docs/report.md` untouched per user instruction.
 
+APIMS history helper added on 2026-05-07:
+
+- `src/pipeline/fetch_apims.py` now supports `--history` mode using the existing APIMS hourly table endpoint.
+- It saves an APIMS-only preview with `merged_timeseries.csv` columns and flags rows as:
+  `BACKFILLED_APIMS_ONLY;WEATHER_MISSING;FIRMS_MISSING;`
+- Verification command used:
+  `python src\pipeline\fetch_apims.py --history --datetime "2026-05-07 15:00" --state-ids 1 --output data\processed\apims_history_preview_state1.csv`
+- Result: 200 rows, 8 stations, 25 hours for state 1.
+- Do not merge APIMS-only preview rows into `merged_timeseries.csv` until a weather/FIRMS missing-data strategy is explicitly chosen.
+
+Multi-source history preview added on 2026-05-07:
+
+- `src/pipeline/pipeline_merge.py` now supports `--history-preview`.
+- It builds a preview from APIMS recent hourly history, WIS2 historical `synop-hourly` station observations, and NASA FIRMS historical pulls for the APIMS date window.
+- Important correction: WIS2 `synop-hourly` is a different historical station-observation product from the METMalaysia `data.json` current weather endpoint. Do not describe it as equivalent METMalaysia historical `data.json` data.
+- `src/pipeline/fetch_metmalaysia.py` now has WIS2 helpers:
+  - `fetch_wis2_history(...)`
+  - `preprocess_wis2(...)`
+- WIS2 weather is matched to APIMS stations by nearest station coordinates in `pipeline_merge.py`. This is more accurate than a fake state join because WIS2 is station-observation data, not the same state forecast schema as `data.json`.
+- Verification command used:
+  `python src\pipeline\pipeline_merge.py --history-preview --datetime "2026-05-07 15:00" --state-ids 1 --output data\processed\multisource_history_preview_state1.csv`
+- Result after WIS2 integration: 200 rows, 8 stations, 25 hours for state 1.
+- `DATA_FLAG` count:
+  `BACKFILLED_PREVIEW;WIS2_SYNOP_OBSERVED;FIRMS_HISTORY;: 200`
+- Inspection showed 0 missing `TEMPERATURE_C` and 0 missing `RAIN_FORECAST_SLOTS`.
+- Running `build_features()` against this preview produced 8 engineered rows, one per state-1 station at `2026-05-07 15:00`, with valid `API_lag24h`.
+- Do not merge this preview into `merged_timeseries.csv` automatically. It is a controlled backfill candidate and should be reviewed first because WIS2 rain is derived from present/past weather descriptions, not the original METMalaysia forecast-slot dictionary.
+
 ## Important Correction From User
 
 On 2026-05-07, the user pasted a long leftover chat history and clarified:

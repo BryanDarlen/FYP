@@ -9,7 +9,7 @@
 
 | Area | Status | Files |
 |------|--------|-------|
-| Data fetching — APIMS, METMalaysia, NASA FIRMS | Done (FIRMS bbox widened to include Sumatra + Kalimantan, the main transboundary haze sources per ASMC; previous bbox excluded most of Riau) | `src/pipeline/fetch_apims.py`, `fetch_firms.py`, `fetch_metmalaysia.py` |
+| Data fetching — APIMS, METMalaysia, NASA FIRMS | Done (FIRMS bbox widened to include Sumatra + Kalimantan; APIMS/FIRMS history preview helpers and separate WIS2 SYNOP preview observations added for controlled backfill inspection) | `src/pipeline/fetch_apims.py`, `fetch_firms.py`, `fetch_metmalaysia.py` |
 | Data preprocessing — clean, deduplicate, standardise, convert timestamps to MYT | Done | inside each fetch script |
 | Data understanding — EDA, histograms, heatmaps, unique counts, describe tables | Done | `data/processed/apims_analysis.xlsx`, `merged_dataset_visualization.png` |
 | Data merge — hourly alignment, state-name normalisation, left joins | Done | `src/pipeline/pipeline_merge.py`, `data/processed/merged_dataset_summary.txt` |
@@ -50,6 +50,7 @@
 - [x] **Add flatline detection** to `validate_snapshot()`: flag stations whose API value is unchanged for ≥ 6 consecutive hours (likely sensor stuck). Append `FLATLINE;` to `DATA_FLAG`. ✅ Done — implemented in `pipeline_merge.py`; requires both identical API across 5 priors AND truly consecutive hours (no gaps). Verified with synthetic test covering stuck/gap/changing/new-station scenarios.
 - [x] **Add spike detection** to `validate_snapshot()`: flag rows where API jumps by > 50 from the previous hour for the same station. Append `SPIKE;` to `DATA_FLAG`. ✅ Done — implemented in `pipeline_merge.py`; uses `abs(current - prev) > 50` to flag both up- and down-spikes; requires the prior row at *exactly* `t-1h` (no flag if there's a gap). Verified with 9-scenario test including boundary case (exactly 50 → not flagged) and flatline regression.
 - [x] **(History helper)** — flatline and spike checks need access to the previous N hours, so they must read from `merged_timeseries.csv` *before* appending the new snapshot. ✅ Done — `_load_recent_history()` helper in `pipeline_merge.py`; spike detection will reuse it.
+- [x] **(Controlled history preview)** — `pipeline_merge.py --history-preview` can now create a preview from APIMS recent hourly history, WIS2 historical SYNOP station observations, and NASA FIRMS historical date-window data without changing `merged_timeseries.csv`. WIS2 is a separate observation product from METMalaysia `data.json`, so rows are flagged as `WIS2_SYNOP_OBSERVED;`. Verified for state 1 at `2026-05-07 15:00`: 200 rows, 8 stations, 25 hours, 0 missing weather fields, and 8 engineered rows after Phase 3 feature engineering.
 
 **Output:** A CSV table with 19 columns:
 `STATION_ID, STATION_LOCATION, STATE_NAME, LATITUDE, LONGITUDE, HOUR_MYT, API, CLASS, TEMPERATURE_C, RAIN_FORECAST_SLOTS, HOTSPOT_COUNT, FRP_MW_MEAN, FRP_MW_MAX, HIGH_CONF_COUNT, HOTSPOT_COUNT_100KM, FRP_MW_MEAN_100KM, FRP_MW_MAX_100KM, HIGH_CONF_COUNT_100KM, DATA_FLAG`
@@ -257,7 +258,7 @@ The standalone `src/pipeline/scheduler.py` (Phase 2) runs the data-collection lo
 ## Key Constraints to Keep in Mind
 
 - **APIMS** updates hourly — schedule fetches no faster than every 60 minutes.
-- **METMalaysia** (`data.json`) is a current-conditions snapshot, not historical — collect it on every scheduled run.
+- **METMalaysia** (`data.json`) is a current-conditions snapshot, not historical — collect it on every scheduled run. **WIS2 `synop-hourly` is a different historical station-observation product**, so use it only for clearly flagged preview/backfill rows unless the methodology/report explicitly justifies mixing it with the scheduler dataset.
 - **NASA FIRMS** (`/1` at the end of the URL) returns only the last 1 day — fetch daily and accumulate.
 - **Offline mode** must show the *last cached data* + *"Last updated: [timestamp]"* — never show a blank screen.
 - **API bands** in Malaysia use API (not US AQI) — make sure the dashboard labels and alert thresholds use Malaysia's system (Good: 0–50, Moderate: 51–100, Unhealthy: 101–200, Very Unhealthy: 201–300, Hazardous: >300).

@@ -21,6 +21,7 @@ src/models/eval_report.json
 src/models/baseline_report.json
 src/models/shap_global_importance.json
 data/processed/_test_backup/
+data/processed/*history_preview*.csv
 
 # --- Editors / OS ---
 .vscode/

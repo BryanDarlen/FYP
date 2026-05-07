@@ -16,6 +16,7 @@ import pandas as pd
 import io
 from pathlib import Path
 from dotenv import load_dotenv
+from typing import Optional
 
 # Load environment variables from the project root .env file (if present).
 # fetch_firms.py lives at <project_root>/src/pipeline/, so parents[2] is root.
@@ -56,11 +57,29 @@ if not FIRMS_MAP_KEY:
         "your FIRMS MAP_KEY (free at https://firms.modaps.eosdis.nasa.gov/api/map_key/)."
     )
 
-FIRMS_URL = (
-    f"https://firms.modaps.eosdis.nasa.gov/api/area/csv"
-    f"/{FIRMS_MAP_KEY}"
-    f"/VIIRS_SNPP_NRT/95,-6,119.5,7.6/1"
-)
+FIRMS_SOURCE = "VIIRS_SNPP_NRT"
+FIRMS_AREA = "95,-6,119.5,7.6"
+
+
+def build_firms_url(day_range: int = 1, start_date: Optional[str] = None) -> str:
+    """
+    Build a NASA FIRMS Area API URL.
+
+    `start_date` is optional and enables historical pulls for preview/backfill.
+    The default preserves the current scheduler behaviour: latest 1-day NRT
+    data over the regional study area.
+    """
+    url = (
+        f"https://firms.modaps.eosdis.nasa.gov/api/area/csv"
+        f"/{FIRMS_MAP_KEY}"
+        f"/{FIRMS_SOURCE}/{FIRMS_AREA}/{day_range}"
+    )
+    if start_date:
+        url = f"{url}/{start_date}"
+    return url
+
+
+FIRMS_URL = build_firms_url()
 
 # Malaysia Time offset (UTC+8) — used to align all timestamps to MYT
 MYT_OFFSET = timedelta(hours=8)
@@ -83,14 +102,14 @@ last_update_firms = None
 # Sends an online request to the NASA FIRMS CSV endpoint and returns
 # the raw response text (CSV format).
 
-async def fetch_firms_data() -> str:
+async def fetch_firms_data(day_range: int = 1, start_date: Optional[str] = None) -> str:
     """
     Fetches VIIRS SNPP Near Real-Time fire hotspot data from NASA FIRMS.
     Returns the raw CSV response as a string.
     Raises httpx.HTTPStatusError if the request fails.
     """
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(FIRMS_URL)
+        response = await client.get(build_firms_url(day_range=day_range, start_date=start_date))
         response.raise_for_status()
         return response.text
 

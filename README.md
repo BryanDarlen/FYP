@@ -48,8 +48,8 @@ The pipeline reads its NASA FIRMS API key from a local `.env` file (never commit
 Bryan Darlen/
 ├── src/
 │   └── pipeline/
-│       ├── fetch_apims.py          # Fetches & cleans APIMS air quality data
-│       ├── fetch_metmalaysia.py    # Fetches & cleans METMalaysia weather data
+│       ├── fetch_apims.py          # Fetches & cleans APIMS current/recent-history air quality data
+│       ├── fetch_metmalaysia.py    # Fetches METMalaysia current data and WIS2 preview observations
 │       ├── fetch_firms.py          # Fetches & cleans NASA FIRMS fire hotspot data
 │       ├── pipeline_merge.py       # Merges all 3 datasets into one snapshot
 │       └── scheduler.py            # Runs the pipeline every hour (PHASE 2)
@@ -137,7 +137,45 @@ Run the scheduler, wait a couple of minutes, then check that rows are appearing 
 
 ---
 
-### Option 4 — Build engineered features (PHASE 3)
+### Option 4 — Preview recent APIMS hourly history
+
+Use this only as an inspection/backfill helper. It does **not** replace the scheduler because it contains APIMS history only; past METMalaysia weather and FIRMS columns are marked missing.
+
+```bash
+python src/pipeline/fetch_apims.py --history --datetime "2026-05-07 15:00" --state-ids 1-16
+```
+
+This writes `data/processed/apims_history_preview.csv` with the same columns as `merged_timeseries.csv`, but APIMS-only rows are clearly flagged:
+
+```text
+BACKFILLED_APIMS_ONLY;WEATHER_MISSING;FIRMS_MISSING;
+```
+
+Do not merge this preview into `merged_timeseries.csv` until the missing weather/FIRMS strategy is decided.
+
+---
+
+### Option 5 — Preview APIMS + METMalaysia + FIRMS history
+
+Use this when you want a fuller backfill preview without changing `merged_timeseries.csv`:
+
+```bash
+python src/pipeline/pipeline_merge.py --history-preview --datetime "2026-05-07 15:00" --state-ids 1 --output data/processed/multisource_history_preview_state1.csv
+```
+
+This uses APIMS recent hourly history, fetches WIS2 `synop-hourly` historical station observations, matches WIS2 stations to APIMS stations by nearest coordinates, and fetches NASA FIRMS for the same date window. It writes a preview only; it does **not** modify `merged_timeseries.csv`.
+
+Typical preview flags:
+
+```text
+BACKFILLED_PREVIEW;WIS2_SYNOP_OBSERVED;FIRMS_HISTORY;
+```
+
+Important: WIS2 is a different data product from the METMalaysia `data.json` current weather endpoint. `TEMPERATURE_C` comes from WIS2 `air_temperature`, while `RAIN_FORECAST_SLOTS` is derived from WIS2 present/past weather descriptions, so treat the preview as a controlled backfill candidate rather than silently mixing it into the scheduler dataset.
+
+---
+
+### Option 6 — Build engineered features (PHASE 3)
 
 Once you have ≥ 25 hours of data per station accumulated, run:
 
@@ -151,7 +189,7 @@ The same `build_features()` function is also imported by the FastAPI backend at 
 
 ---
 
-### Option 5 — Train the forecasting model (PHASE 4)
+### Option 7 — Train the forecasting model (PHASE 4)
 
 Once `features.csv` has accumulated enough rows (target: 2–4 weeks of data so that the test split contains at least one full day), run:
 
@@ -203,8 +241,9 @@ type data\logs\scheduler.log
 | Source | Data | Update Frequency |
 |--------|------|-----------------|
 | [APIMS (DOE)](https://eqms.doe.gov.my) | API readings for 68 stations across Malaysia | Hourly |
-| [METMalaysia](https://api.met.gov.my) | Temperature and rain forecast per state | Hourly snapshot |
-| [NASA FIRMS](https://firms.modaps.eosdis.nasa.gov) | Fire hotspot locations and intensity (VIIRS SNPP) | Daily (last 1 day) |
+| [METMalaysia](https://api.met.gov.my) `data.json` | Current weather snapshot used by the scheduler | Current snapshot |
+| [WIS2 synop-hourly](https://wis2node.met.gov.my/oapi/collections/urn%3Awmo%3Amd%3Amy-metmalaysia%3Asynop-hourly/items?f=html) | Historical SYNOP station observations for controlled preview/backfill only; not the same schema as METMalaysia `data.json` | Hourly observations |
+| [NASA FIRMS](https://firms.modaps.eosdis.nasa.gov) | Fire hotspot locations and intensity (VIIRS SNPP) | Daily/current, with date-window history for preview |
 
 ---
 

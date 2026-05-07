@@ -76,6 +76,7 @@ import requests
 import sys
 import os
 import io
+from typing import Optional
 
 # Radius (km) within which a FIRMS hotspot is considered "local" to a station.
 # 100 km is a practical default — smoke from fires can travel further, but
@@ -89,8 +90,13 @@ OUTPUT_DIR = os.path.normpath(
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fetch_apims import preprocess_apims
-from fetch_metmalaysia import fetch_met_data, preprocess_met
+from fetch_apims import preprocess_apims, build_apims_history_preview, parse_state_ids
+from fetch_metmalaysia import (
+    fetch_met_data,
+    fetch_wis2_history,
+    preprocess_met,
+    preprocess_wis2,
+)
 from fetch_firms import fetch_firms_data, preprocess_firms
 
 # APIMS endpoint — fetched with requests (sync) directly in this file
@@ -99,6 +105,13 @@ APIMS_URL = (
     "/CAQM_MCAQM_Current_Reading/MapServer/0/query"
     "?f=json&outFields=*&returnGeometry=false"
     "&spatialRel=esriSpatialRelIntersects&where=1%3D1"
+)
+
+HISTORY_PREVIEW_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "..", "data", "processed", "multisource_history_preview.csv",
+    )
 )
 
 
@@ -351,6 +364,243 @@ def merge_all(
     merged.reset_index(drop=True, inplace=True)
 
     return merged
+
+
+# =============================================================================
+# STEP 5b - MULTI-SOURCE HISTORY PREVIEW
+# =============================================================================
+# This is a controlled backfill helper. It does not write into
+# merged_timeseries.csv. APIMS can provide recent hourly history, FIRMS can be
+# queried by date, but METMalaysia's current endpoint only exposes a current
+# snapshot. Any incomplete source coverage remains visible in DATA_FLAG.
+
+def _remove_data_flag(flags: pd.Series, flag: str) -> pd.Series:
+    return flags.fillna("").astype(str).str.replace(flag, "", regex=False)
+
+
+def _add_data_flag(flags: pd.Series, flag: str) -> pd.Series:
+    values = flags.fillna("").astype(str)
+    return values.where(values.str.contains(flag, regex=False), values + flag)
+
+
+def _attach_wis2_weather_by_nearest_station(
+    preview: pd.DataFrame,
+    wis2: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Attach WIS2 station observations to APIMS rows by nearest station.
+
+    WIS2 historical data does not use the current METMalaysia data.json
+    schema, so a direct STATE + HOUR join would be misleading. Nearest-station
+    matching keeps the source observable and spatially defensible.
+    """
+    required_wis2 = {
+        "WIGOS_STATION_ID", "HOUR_MYT", "LATITUDE", "LONGITUDE",
+        "TEMPERATURE_C", "RAIN_FORECAST_SLOTS",
+    }
+    required_preview = {"STATION_ID", "LATITUDE", "LONGITUDE", "HOUR_MYT"}
+    if wis2.empty or not required_wis2.issubset(wis2.columns):
+        return preview
+    if preview.empty or not required_preview.issubset(preview.columns):
+        return preview
+
+    apims_stations = (
+        preview[["STATION_ID", "LATITUDE", "LONGITUDE"]]
+        .dropna(subset=["STATION_ID", "LATITUDE", "LONGITUDE"])
+        .drop_duplicates(subset=["STATION_ID"])
+        .rename(columns={"LATITUDE": "APIMS_LATITUDE", "LONGITUDE": "APIMS_LONGITUDE"})
+    )
+    wis2_stations = (
+        wis2[["WIGOS_STATION_ID", "LATITUDE", "LONGITUDE"]]
+        .dropna(subset=["WIGOS_STATION_ID", "LATITUDE", "LONGITUDE"])
+        .drop_duplicates(subset=["WIGOS_STATION_ID"])
+        .rename(columns={"LATITUDE": "WIS2_LATITUDE", "LONGITUDE": "WIS2_LONGITUDE"})
+    )
+    if apims_stations.empty or wis2_stations.empty:
+        return preview
+
+    pairs = apims_stations.merge(wis2_stations, how="cross")
+    pairs["MET_DISTANCE_KM"] = haversine_km(
+        pairs["APIMS_LATITUDE"].to_numpy(),
+        pairs["APIMS_LONGITUDE"].to_numpy(),
+        pairs["WIS2_LATITUDE"].to_numpy(),
+        pairs["WIS2_LONGITUDE"].to_numpy(),
+    )
+    nearest = (
+        pairs.sort_values(["STATION_ID", "MET_DISTANCE_KM"])
+        .drop_duplicates(subset=["STATION_ID"])
+        [["STATION_ID", "WIGOS_STATION_ID", "MET_DISTANCE_KM"]]
+    )
+
+    met_join = wis2.merge(nearest, on="WIGOS_STATION_ID", how="inner")
+    met_join = (
+        met_join[[
+            "STATION_ID", "HOUR_MYT", "TEMPERATURE_C", "RAIN_FORECAST_SLOTS",
+            "MET_DISTANCE_KM",
+        ]]
+        .drop_duplicates(subset=["STATION_ID", "HOUR_MYT"], keep="last")
+    )
+
+    out = preview.drop(columns=["TEMPERATURE_C", "RAIN_FORECAST_SLOTS"], errors="ignore")
+    out = out.merge(met_join, on=["STATION_ID", "HOUR_MYT"], how="left")
+    return out
+
+
+async def build_multisource_history_preview(
+    end_datetime: Optional[str] = None,
+    state_ids: Optional[list[int]] = None,
+) -> pd.DataFrame:
+    """
+    Build a preview table shaped like merged_timeseries.csv using:
+      - APIMS recent hourly history
+      - WIS2 synop-hourly observations where station matching works
+      - NASA FIRMS historical rows for the APIMS preview date window
+
+    Rows remain flagged when weather or FIRMS evidence is unavailable.
+    """
+    preview = build_apims_history_preview(end_datetime=end_datetime, state_ids=state_ids)
+    if preview.empty:
+        return preview
+
+    preview = preview.copy()
+    preview["HOUR_MYT"] = pd.to_datetime(preview["HOUR_MYT"], errors="coerce")
+    preview["DATA_FLAG"] = _remove_data_flag(preview["DATA_FLAG"], "BACKFILLED_APIMS_ONLY;")
+    preview["DATA_FLAG"] = _add_data_flag(preview["DATA_FLAG"], "BACKFILLED_PREVIEW;")
+    hour_min = preview["HOUR_MYT"].min()
+    hour_max = preview["HOUR_MYT"].max()
+
+    # WIS2 synop-hourly: historical station observations, matched by nearest
+    # WIS2 station to each APIMS station. This is a different data product
+    # from the current METMalaysia data.json snapshot.
+    try:
+        raw_wis2 = await fetch_wis2_history(hour_min, hour_max)
+        wis2 = preprocess_wis2(raw_wis2)
+        if not wis2.empty:
+            wis2["HOUR_MYT"] = round_to_hour(wis2["HOUR_MYT"])
+            preview = _attach_wis2_weather_by_nearest_station(preview, wis2)
+
+            weather_ok = preview["TEMPERATURE_C"].notna() & preview["RAIN_FORECAST_SLOTS"].notna()
+            preview.loc[weather_ok, "DATA_FLAG"] = _remove_data_flag(
+                preview.loc[weather_ok, "DATA_FLAG"], "WEATHER_MISSING;"
+            )
+            preview.loc[weather_ok, "DATA_FLAG"] = _add_data_flag(
+                preview.loc[weather_ok, "DATA_FLAG"], "WIS2_SYNOP_OBSERVED;"
+            )
+    except Exception as exc:
+        print(f"[HISTORY PREVIEW] WIS2 synop-hourly fetch skipped: {exc}")
+
+    # Fallback: current METMalaysia snapshot only where the timestamp matches.
+    # This keeps current-hour preview rows usable if WIS2 is unavailable.
+    try:
+        preview["_WEATHER_WAS_MISSING"] = (
+            preview["TEMPERATURE_C"].isna() | preview["RAIN_FORECAST_SLOTS"].isna()
+        )
+        raw_met = await fetch_met_data()
+        met = select_met_columns(preprocess_met(raw_met))
+        if not met.empty and "DATETIME_MYT" in met.columns:
+            met["HOUR_MYT"] = round_to_hour(met["DATETIME_MYT"])
+            met["STATE_CLEAN"] = met["STATE"].apply(clean_state)
+            met = met.drop(columns=["STATE", "DATETIME_MYT"], errors="ignore")
+
+            preview["STATE_CLEAN"] = preview["STATE_NAME"].apply(clean_state)
+            preview = preview.merge(
+                met,
+                on=["STATE_CLEAN", "HOUR_MYT"],
+                how="left",
+                suffixes=("", "_MET"),
+            )
+            for col in ["TEMPERATURE_C", "RAIN_FORECAST_SLOTS"]:
+                met_col = f"{col}_MET"
+                if met_col in preview.columns:
+                    preview[col] = preview[col].where(preview[col].notna(), preview[met_col])
+                    preview.drop(columns=[met_col], inplace=True)
+            preview.drop(columns=["STATE_CLEAN"], inplace=True, errors="ignore")
+
+            current_weather_ok = (
+                preview["_WEATHER_WAS_MISSING"]
+                & preview["TEMPERATURE_C"].notna()
+                & preview["RAIN_FORECAST_SLOTS"].notna()
+            )
+            preview.loc[current_weather_ok, "DATA_FLAG"] = _remove_data_flag(
+                preview.loc[current_weather_ok, "DATA_FLAG"], "WEATHER_MISSING;"
+            )
+            preview.loc[current_weather_ok, "DATA_FLAG"] = _add_data_flag(
+                preview.loc[current_weather_ok, "DATA_FLAG"], "MET_CURRENT_MATCHED;"
+            )
+        preview.drop(columns=["_WEATHER_WAS_MISSING"], inplace=True, errors="ignore")
+    except Exception as exc:
+        preview.drop(columns=["_WEATHER_WAS_MISSING"], inplace=True, errors="ignore")
+        print(f"[HISTORY PREVIEW] METMalaysia fetch skipped: {exc}")
+
+    # NASA FIRMS: pull historical window, then aggregate like the live merge.
+    firms_cols = [
+        "HOTSPOT_COUNT", "FRP_MW_MEAN", "FRP_MW_MAX", "HIGH_CONF_COUNT",
+        "HOTSPOT_COUNT_100KM", "FRP_MW_MEAN_100KM",
+        "FRP_MW_MAX_100KM", "HIGH_CONF_COUNT_100KM",
+    ]
+    try:
+        start_date = hour_min.strftime("%Y-%m-%d")
+        day_range = max(1, min(10, (hour_max.normalize() - hour_min.normalize()).days + 1))
+        raw_firms = await fetch_firms_data(day_range=day_range, start_date=start_date)
+        firms = select_firms_columns(preprocess_firms(raw_firms))
+
+        if not firms.empty:
+            firms["HOUR_MYT"] = round_to_hour(firms["ACQ_DATETIME_MYT"])
+            firms = firms[(firms["HOUR_MYT"] >= hour_min) & (firms["HOUR_MYT"] <= hour_max)]
+
+        if firms.empty:
+            for col in firms_cols:
+                preview[col] = 0
+        else:
+            firms_hourly = aggregate_firms_hourly(firms)
+            stations = preview[["STATION_ID", "LATITUDE", "LONGITUDE"]].drop_duplicates()
+            firms_local = aggregate_firms_per_station(firms, stations, LOCAL_RADIUS_KM)
+
+            preview = preview.drop(columns=firms_cols, errors="ignore")
+            preview = preview.merge(firms_hourly, on="HOUR_MYT", how="left")
+            preview = preview.merge(firms_local, on=["STATION_ID", "HOUR_MYT"], how="left")
+            for col in firms_cols:
+                preview[col] = pd.to_numeric(preview[col], errors="coerce").fillna(0)
+
+        preview["DATA_FLAG"] = _remove_data_flag(preview["DATA_FLAG"], "FIRMS_MISSING;")
+        preview["DATA_FLAG"] = _add_data_flag(preview["DATA_FLAG"], "FIRMS_HISTORY;")
+    except Exception as exc:
+        print(f"[HISTORY PREVIEW] NASA FIRMS fetch skipped: {exc}")
+
+    for col in [
+        "STATION_ID", "STATION_LOCATION", "STATE_NAME", "LATITUDE", "LONGITUDE",
+        "API", "CLASS", "HOUR_MYT", "TEMPERATURE_C", "RAIN_FORECAST_SLOTS",
+        "HOTSPOT_COUNT", "FRP_MW_MEAN", "FRP_MW_MAX", "HIGH_CONF_COUNT",
+        "HOTSPOT_COUNT_100KM", "FRP_MW_MEAN_100KM", "FRP_MW_MAX_100KM",
+        "HIGH_CONF_COUNT_100KM", "DATA_FLAG",
+    ]:
+        if col not in preview.columns:
+            preview[col] = pd.NA
+
+    preview = preview[[
+        "STATION_ID", "STATION_LOCATION", "STATE_NAME", "LATITUDE", "LONGITUDE",
+        "API", "CLASS", "HOUR_MYT", "TEMPERATURE_C", "RAIN_FORECAST_SLOTS",
+        "HOTSPOT_COUNT", "FRP_MW_MEAN", "FRP_MW_MAX", "HIGH_CONF_COUNT",
+        "HOTSPOT_COUNT_100KM", "FRP_MW_MEAN_100KM", "FRP_MW_MAX_100KM",
+        "HIGH_CONF_COUNT_100KM", "DATA_FLAG",
+    ]]
+    return preview.sort_values(["STATION_ID", "HOUR_MYT"]).reset_index(drop=True)
+
+
+def save_history_preview(df: pd.DataFrame, output_path: str = HISTORY_PREVIEW_PATH) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    df.to_csv(output_path, index=False)
+    print(f"[HISTORY PREVIEW] Saved: {output_path}")
+    print(f"[HISTORY PREVIEW] Rows: {len(df):,}")
+    if not df.empty:
+        print(f"[HISTORY PREVIEW] Stations: {df['STATION_ID'].nunique()}")
+        print(f"[HISTORY PREVIEW] Hours: {df['HOUR_MYT'].nunique()}")
+        print(f"[HISTORY PREVIEW] Range: {df['HOUR_MYT'].min()} -> {df['HOUR_MYT'].max()}")
+        flag_counts = df["DATA_FLAG"].fillna("").astype(str).value_counts()
+        print("[HISTORY PREVIEW] DATA_FLAG counts:")
+        for flag, count in flag_counts.items():
+            label = flag if flag else "(clean)"
+            print(f"[HISTORY PREVIEW]   {label}: {count}")
 
 
 # =============================================================================
@@ -650,8 +900,41 @@ def save_snapshot(df: pd.DataFrame) -> None:
 # =============================================================================
 
 if __name__ == "__main__":
+    import argparse
     import asyncio
     import traceback
+
+    parser = argparse.ArgumentParser(description="Merge APIMS, METMalaysia, and NASA FIRMS data.")
+    parser.add_argument(
+        "--history-preview",
+        action="store_true",
+        help="Build a multi-source historical preview CSV without changing merged_timeseries.csv.",
+    )
+    parser.add_argument(
+        "--datetime",
+        dest="end_datetime",
+        default=None,
+        help='Ending hour for APIMS history, for example "2026-05-07 15:00".',
+    )
+    parser.add_argument(
+        "--state-ids",
+        default="1-16",
+        help='APIMS state ids to fetch, for example "1-16" or "1,2,14".',
+    )
+    parser.add_argument(
+        "--output",
+        default=HISTORY_PREVIEW_PATH,
+        help="Output CSV path for --history-preview mode.",
+    )
+    args = parser.parse_args()
+
+    if args.history_preview:
+        preview_df = asyncio.run(build_multisource_history_preview(
+            end_datetime=args.end_datetime,
+            state_ids=parse_state_ids(args.state_ids),
+        ))
+        save_history_preview(preview_df, args.output)
+        sys.exit(0)
 
     async def run_test():
         print("\n" + "=" * 65)

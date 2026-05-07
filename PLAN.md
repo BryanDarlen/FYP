@@ -9,11 +9,18 @@
 
 | Area | Status | Files |
 |------|--------|-------|
-| Data fetching — APIMS, METMalaysia, NASA FIRMS | Done | `src/pipeline/fetch_apims.py`, `fetch_firms.py`, `fetch_metmalaysia.py` |
+| Data fetching — APIMS, METMalaysia, NASA FIRMS | Done (FIRMS bbox widened to include Sumatra + Kalimantan, the main transboundary haze sources per ASMC; previous bbox excluded most of Riau) | `src/pipeline/fetch_apims.py`, `fetch_firms.py`, `fetch_metmalaysia.py` |
 | Data preprocessing — clean, deduplicate, standardise, convert timestamps to MYT | Done | inside each fetch script |
 | Data understanding — EDA, histograms, heatmaps, unique counts, describe tables | Done | `data/processed/apims_analysis.xlsx`, `merged_dataset_visualization.png` |
 | Data merge — hourly alignment, state-name normalisation, left joins | Done | `src/pipeline/pipeline_merge.py`, `data/processed/merged_dataset_summary.txt` |
 | Investigation report (Chapters 1–4) | Done | `docs/report.md` |
+
+### Outstanding Actions (do before final submission)
+
+- [x] **Rotate FIRMS MAP_KEY.** ✅ Done. Old key revoked at NASA; new key stored in `.env` (gitignored) and loaded via `python-dotenv` in `fetch_firms.py`. Stale Windows User-level env var also cleared.
+- [ ] **(Conditional) Scrub git history of the old MAP_KEY** — only if this repo has ever been pushed to a public remote. If the repo has only lived locally, no action needed beyond the rotation. (Old key is now revoked, so it's a dead string in history either way.)
+
+---
 
 **Current state of merged dataset (one snapshot, 2026-03-11 21:00 MYT):**
 - 68 rows (one per APIMS station), 11 columns
@@ -30,34 +37,57 @@
 ### PHASE 2 — Build a Historical Time Series Dataset
 **Why:** The current pipeline only captures a single snapshot. The forecasting model needs continuous hourly data over weeks/months to learn patterns and to be tested on haze vs. normal days.
 
-**Tasks:**
-- [ ] Run the pipeline on a schedule (every hour) and **append** each merged snapshot to a growing dataset instead of overwriting it.
-- [ ] Store accumulated records in `data/processed/merged_timeseries.csv` (or SQLite `data/airquality.db`).
-- [ ] Collect at minimum 2–4 weeks of data before starting model training. Target: include at least one haze episode (API > 100 at any station).
-- [ ] Add a data validation step: flag impossible values (API < 0, temperature > 50°C), sudden flatlines (same API reading for 6+ consecutive hours), and large spikes (API jump > 50 in one hour).
+**Storage decision:** CSV (`data/processed/merged_timeseries.csv`) — not SQLite — for the FYP. Simpler to inspect, version, and load with `pandas`. Migrate to SQLite only if file grows past ~100 MB.
 
-**Output:** A CSV/SQLite table with columns:
-`STATION_ID, STATION_LOCATION, STATE_NAME, LAT, LON, HOUR_MYT, API, CLASS, TEMPERATURE_C, RAIN_FORECAST_SLOTS, HOTSPOT_COUNT, FRP_MW_MEAN, FRP_MW_MAX, HIGH_CONF_COUNT, HOTSPOT_COUNT_100KM, FRP_MW_MEAN_100KM, FRP_MW_MAX_100KM, HIGH_CONF_COUNT_100KM`
+**Already implemented (Phase 1 → 2 carry-over):**
+- [x] Hourly scheduler — `src/pipeline/scheduler.py` runs `fetch → merge → validate → save` every 60 minutes.
+- [x] Append-mode save — `pipeline_merge.save_snapshot()` appends each snapshot to `merged_timeseries.csv`; never overwrites. Auto-creates `data/processed/` if missing.
+- [x] Basic validation — `validate_snapshot()` flags `INVALID_API` (API < 0 or > 500), `INVALID_TEMP` (out-of-range temperature), and negative hotspot counts via the `DATA_FLAG` column.
+- [x] **End-to-end smoke test** — verified scheduler runs cleanly through one full cycle: APIMS (68 rows) + METMalaysia (16 rows) + FIRMS, merge, validate, save. CSV at `data/processed/merged_timeseries.csv` confirmed to have all 19 expected columns (incl. `_100KM` station-local FIRMS) and `DATA_FLAG` clean for normal operation.
+
+**Remaining tasks:**
+- [ ] **Run the scheduler continuously for ≥ 2–4 weeks** to accumulate training data. Target: capture at least one haze episode (API > 100 at any station). Indonesia's typical fire/haze season is July–October per ASMC — collection started outside this window will produce a "clean-only" dataset, which is fine for baseline accuracy but won't test haze-event behaviour.
+- [x] **Add flatline detection** to `validate_snapshot()`: flag stations whose API value is unchanged for ≥ 6 consecutive hours (likely sensor stuck). Append `FLATLINE;` to `DATA_FLAG`. ✅ Done — implemented in `pipeline_merge.py`; requires both identical API across 5 priors AND truly consecutive hours (no gaps). Verified with synthetic test covering stuck/gap/changing/new-station scenarios.
+- [x] **Add spike detection** to `validate_snapshot()`: flag rows where API jumps by > 50 from the previous hour for the same station. Append `SPIKE;` to `DATA_FLAG`. ✅ Done — implemented in `pipeline_merge.py`; uses `abs(current - prev) > 50` to flag both up- and down-spikes; requires the prior row at *exactly* `t-1h` (no flag if there's a gap). Verified with 9-scenario test including boundary case (exactly 50 → not flagged) and flatline regression.
+- [x] **(History helper)** — flatline and spike checks need access to the previous N hours, so they must read from `merged_timeseries.csv` *before* appending the new snapshot. ✅ Done — `_load_recent_history()` helper in `pipeline_merge.py`; spike detection will reuse it.
+
+**Output:** A CSV table with 19 columns:
+`STATION_ID, STATION_LOCATION, STATE_NAME, LATITUDE, LONGITUDE, HOUR_MYT, API, CLASS, TEMPERATURE_C, RAIN_FORECAST_SLOTS, HOTSPOT_COUNT, FRP_MW_MEAN, FRP_MW_MAX, HIGH_CONF_COUNT, HOTSPOT_COUNT_100KM, FRP_MW_MEAN_100KM, FRP_MW_MAX_100KM, HIGH_CONF_COUNT_100KM, DATA_FLAG`
+
+The `DATA_FLAG` column is empty (`""` or `NaN`) for clean rows; flagged rows carry one or more semicolon-separated tags: `INVALID_API`, `INVALID_TEMP`, `INVALID_HOTSPOT`, `INVALID_HOTSPOT_LOCAL`, `FLATLINE`, `SPIKE`. See README's "What it does every 60 minutes" section for definitions.
 
 > **Note on FIRMS columns.** Two granularities are kept:
-> - The original four columns (`HOTSPOT_COUNT`, `FRP_MW_MEAN`, `FRP_MW_MAX`, `HIGH_CONF_COUNT`) are a **national** hourly summary — the same value is attached to every station for that hour. Useful for transboundary haze episodes (e.g. fires in Sumatra/Riau driving haze across the whole country).
-> - The four `_100KM` columns are **station-local**: only fires within 100 km of the specific station, computed via great-circle distance between FIRMS hotspot lat/lon and the station's lat/lon. Useful for direct local fire impact and for cleaner SHAP explanations on the dashboard.
+> - The original four columns (`HOTSPOT_COUNT`, `FRP_MW_MEAN`, `FRP_MW_MAX`, `HIGH_CONF_COUNT`) are a **national** hourly summary — the same value is attached to every station for that hour. Useful for transboundary haze episodes (e.g. fires in Sumatra/Kalimantan driving haze across the whole country, as monitored regionally by the ASEAN Specialised Meteorological Centre).
+> - The four `_100KM` columns are **station-local**: only fires within 100 km of the specific station, computed via great-circle (haversine) distance between each FIRMS hotspot's lat/lon (each detection is the centre of a 375 m VIIRS pixel — see NASA FIRMS VIIRS documentation) and the station's lat/lon. Useful for direct local fire impact and for cleaner SHAP explanations on the dashboard.
 >
-> The 100 km radius is an engineering choice, not a published standard — there is no fixed buffer in the FIRMS documentation. It is justified by the established finding that wildfire smoke degrades PM2.5 in downwind areas "tens to hundreds of kilometers" from the source. Adjustable via the `LOCAL_RADIUS_KM` constant in `pipeline_merge.py`.
+> **Why 100 km?** It is an engineering default, not a published standard — NASA FIRMS documentation does not prescribe a buffer distance for air-quality applications (FIRMS is targeted at fire management, not AQ forecasting). The choice is justified by the empirical finding from Jaffe et al. (2008, *Environ. Sci. Technol.* 42(8): 2812–2818) that wildfire smoke degrades PM2.5 in downwind areas "tens to hundreds of kilometers" from the fire source. 100 km sits in the middle of that range, balancing signal strength (close fires affect the station strongly) against false negatives (smoke can travel further). Adjustable via the `LOCAL_RADIUS_KM` constant in `pipeline_merge.py` — consider running a small sensitivity check at 50 km and 200 km during model evaluation.
 
 ---
 
 ### PHASE 3 — Feature Engineering
 **Why:** Raw columns are not enough. The model needs lag features (past API values) and interaction signals to learn short-term trends.
 
-**Tasks:**
-- [ ] Create **lag features** per station: `API_lag1h`, `API_lag2h`, `API_lag3h`, `API_lag6h`, `API_lag12h`, `API_lag24h`
-- [ ] Create **rolling averages**: `API_roll3h`, `API_roll6h`, `API_roll12h` (these also serve the "episode shape" chart toggle in the UI)
-- [ ] Create **time features**: `HOUR_OF_DAY`, `DAY_OF_WEEK`, `IS_WEEKEND`
-- [ ] Create **fire-weather interaction**: `FIRE_AND_DRY` = 1 if `HOTSPOT_COUNT_100KM > 0` AND `RAIN_FORECAST_SLOTS == 0` (use the station-local hotspot count so the feature reflects fires that can plausibly affect *this* station, not fires anywhere in Malaysia)
-- [ ] Handle missing values: forward-fill gaps up to 2 hours; if gap > 2 hours, mark as `DATA_MISSING = 1`
+**Where the code lives:** A new file `src/pipeline/feature_engineering.py` exposing **one** function:
+```python
+def build_features(df: pd.DataFrame) -> pd.DataFrame
+```
+which takes a sorted-by-`(STATION_ID, HOUR_MYT)` DataFrame and returns it with all engineered columns added. Always group by `STATION_ID` before computing any per-station feature, otherwise lag values from one station leak into another.
 
-**Output:** Enriched dataset ready for model training, saved as `data/processed/features.csv`
+**When it runs (critical to get right):**
+- **At training time** — load full `merged_timeseries.csv`, call `build_features(df)` once, save to `features.csv`, train model.
+- **At inference time** — when the FastAPI backend serves `/forecast/{station_id}`, it loads the *last 25 hours* for that station from the CSV, calls the **same** `build_features()` function, takes the most recent row, and feeds it to the model.
+
+Using one function for both prevents train/serve skew (the most common silent bug in ML systems).
+
+**Tasks:**
+- [x] Create `src/pipeline/feature_engineering.py` with `build_features(df)`. ✅ Done — single function used at both training and inference; CLI entry point materialises `data/processed/features.csv`.
+- [x] **Lag features** per station: `API_lag1h`, `API_lag2h`, `API_lag3h`, `API_lag6h`, `API_lag12h`, `API_lag24h` — use `df.groupby('STATION_ID')['API'].shift(N)`. ✅ Done.
+- [x] **Rolling averages** per station: `API_roll3h`, `API_roll6h`, `API_roll12h` — use `groupby('STATION_ID')['API'].rolling(N).mean()`. ✅ Done; also feed the "episode shape" chart toggle in the UI.
+- [x] **Time features** from `HOUR_MYT`: `HOUR_OF_DAY` (0–23), `DAY_OF_WEEK` (0–6), `IS_WEEKEND` (0/1). ✅ Done.
+- [x] **Fire-weather interaction**: `FIRE_AND_DRY = 1` if `HOTSPOT_COUNT_100KM > 0` AND `RAIN_FORECAST_SLOTS == 0`. Uses the station-local hotspot count so the feature reflects fires that can plausibly affect *this* station, not fires anywhere in Malaysia. ✅ Done.
+- [x] **Missing-value handling**: forward-fill API gaps up to 2 hours per station; if gap > 2 hours, set `DATA_MISSING = 1`. Drop rows where any required lag/rolling feature is NaN (covers PLAN's `API_lag24h` rule and gap-induced NaN propagation). ✅ Done. Verified with 16-check synthetic test covering continuous data, 1-hour gap (ffilled), and 5-hour gap (partial drop).
+
+**Output:** Enriched dataset saved as `data/processed/features.csv`. The same `build_features()` function is also imported and called by the FastAPI backend at inference time.
 
 ---
 
@@ -65,13 +95,15 @@
 **Why:** This is Objective 2 — generate 1–24h API predictions and trigger alerts.
 
 **Tasks:**
-- [ ] **Baseline first:** Train a simple Linear Regression and a persistence model (next hour = current hour) to get a baseline RMSE/MAE.
-- [ ] **Main model:** Train a Random Forest or Gradient Boosting Regressor (scikit-learn) on the feature set. This is the recommended first model before trying LSTM.
-- [ ] **Target variable:** `API` at `t+1h`, `t+3h`, `t+6h`, `t+12h`, `t+24h` — train one model per forecast horizon OR a multi-output regressor.
-- [ ] **Split:** Use time-based split (train on earlier data, test on later data — never random shuffle for time series).
-- [ ] **Evaluate:** Report RMSE, MAE, and threshold accuracy (% of time the model correctly predicts whether API crosses 100 or 200).
-- [ ] **Explainability:** Use SHAP values to show which features (rain, hotspots, lag API, temperature) drove each prediction. This feeds the "why it's happening" explanation in the UI.
-- [ ] **Save model:** Export trained model to `src/models/forecast_model.pkl` using `joblib`.
+- [x] **Baseline first:** Persistence baseline (predict next hour = current hour) + Linear Regression. ✅ Done — both implemented in `src/models/train.py`; their RMSE/MAE per horizon is saved to `baseline_report.json` for comparison.
+- [x] **Main model:** `MultiOutputRegressor(RandomForestRegressor)` covering all 5 horizons in one fit. ✅ Done — `RF_PARAMS` constant in `train.py` (200 trees, `min_samples_leaf=5`, all cores).
+- [x] **Target variable:** `API` at `[t+1h, t+3h, t+6h, t+12h, t+24h]` via `groupby('STATION_ID').shift(-N)`; trailing rows with any NaN target are dropped. ✅ Done — `build_targets()` function.
+- [x] **Split:** 80/20 chronological by unique `HOUR_MYT`. ✅ Done — `chronological_split()` function; same cutoff applied across all stations.
+- [x] **Evaluate:** Per-horizon RMSE, MAE, plus threshold confusion matrix at API=100 and API=200 with precision/recall on the crossing event. ✅ Done — `evaluate()` function; output in `eval_report.json`.
+- [x] **Explainability:** `shap.TreeExplainer` on the t+1h Random Forest, sampled to 500 test rows for speed; global mean |SHAP value| ranking saved to `shap_global_importance.json`. Per-prediction SHAP for the dashboard "why" panel happens at inference time (Phase 5). ✅ Done.
+- [x] **Save model:** `joblib.dump` to `src/models/forecast_model.pkl`; feature column manifest to `src/models/feature_columns.json`. ✅ Done.
+
+**Verified:** end-to-end smoke test on synthetic 3-week dataset (20 stations × 504 hours) produces all 5 artefacts, Random Forest beats both baselines on RMSE across all horizons. The script is ready to run on real data the moment `features.csv` is materialisable (~25h of accumulation per station).
 
 **Alert logic (rules, not ML):**
 - API prediction ≥ 100 → "Unhealthy — stop outdoor activities"
@@ -86,10 +118,15 @@
 
 **File to create:** `src/api/main.py`
 
+**Relationship with the existing `scheduler.py`:**
+The standalone `src/pipeline/scheduler.py` (Phase 2) runs the data-collection loop in its own process. In Phase 5, that loop **moves inside the FastAPI app** via APScheduler — so a single `uvicorn` process serves the API *and* runs the hourly pipeline + prediction step. After Phase 5 is working, `scheduler.py` becomes redundant and should be deleted (or kept only as a fallback for offline data collection without the API).
+
 **Tasks:**
-- [ ] Set up FastAPI app with Uvicorn (`uvicorn src.api.main:app --reload`)
-- [ ] Set up APScheduler to run the full pipeline (fetch → clean → merge → predict) every **60 minutes**
-- [ ] Store the latest merged + predicted result in SQLite (`data/airquality.db`) AND as a JSON file (`data/cache/latest.json`) for offline fallback
+- [ ] Set up FastAPI app with Uvicorn (`uvicorn src.api.main:app --reload`).
+- [ ] Configure APScheduler (`AsyncIOScheduler`) inside the FastAPI app's startup event to run `fetch → merge → validate → save → build_features → predict` every **60 minutes**. Reuse the same `run_once()` logic that's in `scheduler.py` today.
+- [ ] At app startup, `joblib.load('src/models/forecast_model.pkl')` once and keep it in memory — never reload per request.
+- [ ] Store the latest merged + predicted result in SQLite (`data/airquality.db`) AND as a JSON file (`data/cache/latest.json`) for offline fallback. JSON is the source of truth for the `/latest` endpoint; SQLite is for historical queries by the dashboard's trend chart.
+- [ ] After Phase 5 is verified, **delete `src/pipeline/scheduler.py`** to avoid two competing schedulers.
 - [ ] Implement these endpoints:
 
 | Endpoint | Returns |
@@ -208,12 +245,12 @@
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 1 | Data pipeline: fetch, clean, merge (one snapshot) | ✅ Done |
-| 2 | Historical time series collection (hourly append, 2–4 weeks) | ⬜ Not started |
-| 3 | Feature engineering (lags, rolling avg, time features, fire-weather interaction) | ⬜ Not started |
-| 4 | ML model training, evaluation, SHAP explainability | ⬜ Not started |
+| 2 | Historical time series collection (hourly append, 2–4 weeks) | 🟡 In progress — **all code complete** (scheduler, append, all 5 validation flags, end-to-end smoke test passed). Only remaining task: leave the scheduler running for ≥ 2–4 weeks to accumulate training data. |
+| 3 | Feature engineering (lags, rolling avg, time features, fire-weather interaction) | ✅ Code complete — `feature_engineering.py` ready; will populate `features.csv` once ≥25h of data per station accumulates |
+| 4 | ML model training, evaluation, SHAP explainability | ✅ Code complete — `train.py` ready; produces 5 artefacts under `src/models/` once `features.csv` exists |
 | 5 | FastAPI backend (scheduler, SQLite, endpoints, offline cache) | ⬜ Not started |
 | 6 | HTML dashboard (map, forecast chart, alerts, cause explanation, offline banner) | ⬜ Not started |
-| 7 | Testing: forecast accuracy, offline mode, alert thresholds, stress test | ⬜ Not started |
+| 7 | Testing: forecast accuracy, offline mode, alert thresholds, stress test | ⬜ Final evaluation not started; current synthetic/unit smoke tests pass (`python tests/run_all.py`) |
 
 ---
 

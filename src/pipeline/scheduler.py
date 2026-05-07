@@ -148,9 +148,9 @@ INTERVAL_SECONDS = 3600  # change to 60 for quick testing
 
 
 async def main() -> None:
-    logger.info("╔══════════════════════════════════════════════════════════╗")
-    logger.info("║  FYP Hourly Pipeline Scheduler  —  PHASE 2 started       ║")
-    logger.info("╚══════════════════════════════════════════════════════════╝")
+    logger.info("=" * 60)
+    logger.info("  FYP Hourly Pipeline Scheduler  -  PHASE 2 started")
+    logger.info("=" * 60)
     logger.info(f"Interval : {INTERVAL_SECONDS} seconds ({INTERVAL_SECONDS // 60} minutes)")
     logger.info(f"Output   : data/processed/merged_timeseries.csv")
     logger.info(f"Log file : {LOG_FILE}")

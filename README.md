@@ -1,5 +1,3 @@
-# FYP
-=======
 # Predicting Air Pollution Levels in Malaysia Using Real-Time Web Data
 
 **Student:** Bryan Quinn Darlen | APU3F2511 | TP073947  
@@ -20,8 +18,27 @@ This system fetches real-time air quality, weather, and fire hotspot data from t
 Install all required libraries before running anything:
 
 ```bash
-pip install pandas requests httpx fastapi matplotlib
+pip install -r requirements.txt
 ```
+
+Versions are pinned in `requirements.txt`. Later phases (model training, FastAPI serving) have their additional packages listed there too — uncomment them when you reach that phase.
+
+---
+
+## Setup
+
+The pipeline reads its NASA FIRMS API key from a local `.env` file (never commit this).
+
+1. Get a free MAP_KEY from [https://firms.modaps.eosdis.nasa.gov/api/map_key/](https://firms.modaps.eosdis.nasa.gov/api/map_key/).
+2. Copy the template and fill in your key:
+
+   ```bash
+   # Windows PowerShell
+   Copy-Item .env.example .env
+   ```
+3. Open `.env` and replace `your_firms_key_here` with the key from step 1.
+
+`.env` is excluded by `.gitignore`, so the key stays local. If `FIRMS_MAP_KEY` is missing, `fetch_firms.py` raises a clear error on startup.
 
 ---
 
@@ -48,9 +65,18 @@ Bryan Darlen/
 │   └── logs/
 │       └── scheduler.log           # Full run history with timestamps (auto-created)
 ├── docs/
-│   └── report.md
+│   ├── blueprint.md                # Original concept / aims (editable)
+│   ├── report.md                   # Formal investigation report (editable)
+│   └── submissions/                # Submitted .docx snapshots — do not edit
+│       ├── blueprint.docx
+│       ├── investigation_report.docx
+│       └── project_proposal_form.docx
+├── .env                            # Local secrets (gitignored, you create this)
+├── .env.example                    # Template for .env (committed)
+├── .gitignore
 ├── PLAN.md
-└── README.md
+├── README.md
+└── requirements.txt                # Pinned Python dependencies
 ```
 
 ---
@@ -82,7 +108,12 @@ python src/pipeline/scheduler.py
 **What it does every 60 minutes:**
 1. Fetches fresh data from APIMS, METMalaysia, and NASA FIRMS
 2. Merges the 3 datasets into one snapshot (~68 rows, one per station)
-3. Validates the data and flags impossible values (without deleting them)
+3. Validates the data and flags suspicious rows in the `DATA_FLAG` column (rows are *not* deleted — they stay in the dataset for inspection):
+   - `INVALID_API` — API value outside 0–500
+   - `INVALID_TEMP` — temperature > 50°C
+   - `INVALID_HOTSPOT` / `INVALID_HOTSPOT_LOCAL` — negative hotspot count
+   - `FLATLINE` — same API value for 6 consecutive hours (likely stuck sensor)
+   - `SPIKE` — API change > 50 from previous hour (likely sensor glitch or real episode)
 4. Appends the snapshot to `data/processed/merged_timeseries.csv`
 5. Logs the result to `data/logs/scheduler.log` and the terminal
 
@@ -92,7 +123,7 @@ python src/pipeline/scheduler.py
 
 ### Option 3 — Quick test (1-minute interval instead of 1 hour)
 
-Open [src/pipeline/scheduler.py](src/pipeline/scheduler.py) and change line 113:
+Open [src/pipeline/scheduler.py](src/pipeline/scheduler.py) and change the `INTERVAL_SECONDS` constant (around line 147):
 
 ```python
 # Change this:
@@ -106,18 +137,54 @@ Run the scheduler, wait a couple of minutes, then check that rows are appearing 
 
 ---
 
-## Checking Progress
+### Option 4 — Build engineered features (PHASE 3)
 
-**See how many rows have been collected:**
+Once you have ≥ 25 hours of data per station accumulated, run:
 
 ```bash
-python -c "import pandas as pd; df = pd.read_csv('data/processed/merged_timeseries.csv'); print(f'{len(df)} rows | {df[\"HOUR_MYT\"].nunique()} hours collected')"
+python src/pipeline/feature_engineering.py
 ```
 
-**View the latest snapshot:**
+This reads `merged_timeseries.csv`, applies feature engineering (lag, rolling average, time, fire-weather interaction, missing-value handling), and writes `data/processed/features.csv`. Until 25 hours are collected, the script reports "no rows survived" and exits cleanly — that's expected.
+
+The same `build_features()` function is also imported by the FastAPI backend at inference time (Phase 5), so the model sees identical feature semantics during training and serving.
+
+---
+
+### Option 5 — Train the forecasting model (PHASE 4)
+
+Once `features.csv` has accumulated enough rows (target: 2–4 weeks of data so that the test split contains at least one full day), run:
 
 ```bash
-python -c "import pandas as pd; df = pd.read_csv('data/processed/merged_timeseries.csv'); print(df.tail(10).to_string())"
+python src/models/train.py
+```
+
+This produces five artefacts under `src/models/`:
+
+| File | What it contains |
+|---|---|
+| `forecast_model.pkl` | Trained `MultiOutputRegressor(RandomForestRegressor)` for all 5 horizons |
+| `feature_columns.json` | Feature column order — used by Phase 5 backend at inference |
+| `eval_report.json` | Per-horizon RMSE, MAE, and threshold precision/recall at API=100/200 |
+| `baseline_report.json` | Same metrics for persistence + linear regression baselines (the floor RF must beat) |
+| `shap_global_importance.json` | Global feature ranking for the t+1h horizon (sample of 500 rows) |
+
+The script also prints a side-by-side RMSE table (Persistence | Linear | RF) so you can see at a glance whether the main model is worth its complexity.
+
+## Checking Progress
+
+**Quick status of the accumulating dataset (rows, hours, API range, flag breakdown):**
+
+```bash
+python check_progress.py
+```
+
+Run this anytime in a separate terminal — it's read-only and does not interfere with the running scheduler.
+
+**View the latest 10 rows:**
+
+```bash
+python -c "import pandas as pd; print(pd.read_csv('data/processed/merged_timeseries.csv').tail(10).to_string())"
 ```
 
 **Check the log file:**
@@ -154,10 +221,16 @@ type data\logs\scheduler.log
 | `CLASS` | API band label (Good / Moderate / Unhealthy / etc.) |
 | `TEMPERATURE_C` | Temperature at that state (°C) |
 | `RAIN_FORECAST_SLOTS` | Number of forecast slots with rain |
+| **National FIRMS summary** (same value for every station that hour) ||
 | `HOTSPOT_COUNT` | Total fire hotspots detected nationally that hour |
-| `FRP_MW_MEAN` | Average fire radiative power (MW) |
-| `FRP_MW_MAX` | Peak fire radiative power (MW) |
-| `HIGH_CONF_COUNT` | High-confidence hotspot count |
+| `FRP_MW_MEAN` | Average fire radiative power (MW), nationally |
+| `FRP_MW_MAX` | Peak fire radiative power (MW), nationally |
+| `HIGH_CONF_COUNT` | High-confidence hotspot count, nationally |
+| **Station-local FIRMS summary** (only fires within 100 km of the station, computed via great-circle/haversine distance) ||
+| `HOTSPOT_COUNT_100KM` | Fires within 100 km of this station that hour |
+| `FRP_MW_MEAN_100KM` | Mean fire radiative power of those nearby fires |
+| `FRP_MW_MAX_100KM` | Strongest nearby fire intensity |
+| `HIGH_CONF_COUNT_100KM` | High-confidence nearby detections only |
 | `DATA_FLAG` | Validation flags (empty = clean row) |
 
 ---
@@ -180,9 +253,8 @@ type data\logs\scheduler.log
 |-------|-------------|--------|
 | 1 | Data pipeline: fetch, clean, merge (one snapshot) | Done |
 | 2 | Historical time series collection (hourly append, 2–4 weeks) | In progress |
-| 3 | Feature engineering (lags, rolling averages, time features) | Not started |
-| 4 | ML model training, evaluation, SHAP explainability | Not started |
+| 3 | Feature engineering (lags, rolling averages, time features, fire-weather interaction) | Code complete (waiting for 25h data/station to materialise features.csv) |
+| 4 | ML model training, evaluation, SHAP explainability | Code complete (waiting for features.csv to materialise) |
 | 5 | FastAPI backend (scheduler, SQLite, endpoints, offline cache) | Not started |
 | 6 | HTML dashboard (map, forecast chart, alerts, cause explanation) | Not started |
-| 7 | Testing: forecast accuracy, offline mode, alert thresholds | Not started |
->>>>>>> fccf1bc (FYP Files)
+| 7 | Testing: forecast accuracy, offline mode, alert thresholds | Final evaluation not started; current synthetic/unit smoke tests pass |

@@ -341,7 +341,7 @@ def merge_all(
         "FRP_MW_MAX_100KM",   "HIGH_CONF_COUNT_100KM",
     ]:
         if col in merged.columns:
-            merged[col] = merged[col].fillna(0)
+            merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
 
     # ── H) Drop helper columns no longer needed ───────────────────────────────
     merged.drop(columns=["STATE_CLEAN", "DATETIME"], inplace=True, errors="ignore")
@@ -464,6 +464,27 @@ def visualize_merged(df: pd.DataFrame) -> None:
 # Checks each snapshot for impossible or suspicious values before saving.
 # Rows are NOT dropped — they are flagged so bad data is visible in the dataset.
 
+# Path to the accumulated timeseries CSV. Forward-referenced — defined later in
+# the file under STEP 9, but resolved at call time (Python module-level scope).
+# Validation reads this file to get the previous N hours per station, which is
+# how flatline and spike detection compare against history.
+
+def _load_recent_history(history_path: str, n_per_station: int = 5) -> pd.DataFrame:
+    """
+    Return the last `n_per_station` rows per station from the timeseries CSV.
+
+    Used by validate_snapshot for checks that need prior context (flatline,
+    spike). Returns an empty DataFrame if the CSV does not yet exist (first
+    pipeline run) — the caller treats this as "insufficient history, skip".
+    """
+    if not os.path.exists(history_path):
+        return pd.DataFrame()
+
+    history = pd.read_csv(history_path, parse_dates=["HOUR_MYT"])
+    history = history.sort_values(["STATION_ID", "HOUR_MYT"])
+    return history.groupby("STATION_ID", group_keys=False).tail(n_per_station)
+
+
 def validate_snapshot(df: pd.DataFrame) -> pd.DataFrame:
     import logging
     logger = logging.getLogger("pipeline")
@@ -495,6 +516,87 @@ def validate_snapshot(df: pd.DataFrame) -> pd.DataFrame:
                 logger.warning(f"[VALIDATE] {mask_hs.sum()} rows with negative {hs_col}")
                 df.loc[mask_hs, "DATA_FLAG"] += flag_tag
 
+    # Flatline detection — same API value for 6 consecutive hours (current + 5
+    # prior). A stuck sensor is the most common silent failure: it keeps
+    # returning the last good reading instead of timing out. We need to flag
+    # the row, not drop it, so the model can learn to down-weight stuck rows.
+    history = _load_recent_history(TIMESERIES_PATH, n_per_station=5)
+    if not history.empty and "API" in df.columns:
+        df["HOUR_MYT"] = pd.to_datetime(df["HOUR_MYT"])
+        history["HOUR_MYT"] = pd.to_datetime(history["HOUR_MYT"])
+
+        flatline_count = 0
+        for station_id, current_rows in df.groupby("STATION_ID"):
+            current_row = current_rows.iloc[0]
+            current_api = current_row["API"]
+            current_hour = current_row["HOUR_MYT"]
+
+            station_history = history[history["STATION_ID"] == station_id]
+            if len(station_history) < 5:
+                continue  # not enough history yet
+
+            # Require: 5 priors are at exactly hour-1, hour-2, ..., hour-5
+            expected_hours = pd.date_range(
+                end=current_hour - pd.Timedelta(hours=1),
+                periods=5, freq="h"
+            )
+            actual_hours = station_history["HOUR_MYT"].sort_values().reset_index(drop=True)
+            if not (actual_hours.values == expected_hours.values).all():
+                continue  # gap in history — not 6 consecutive hours
+
+            # Require: all 5 priors AND current row have identical API
+            if pd.isna(current_api):
+                continue
+            if not (station_history["API"] == current_api).all():
+                continue
+
+            df.loc[df["STATION_ID"] == station_id, "DATA_FLAG"] += "FLATLINE;"
+            flatline_count += 1
+
+        if flatline_count:
+            logger.warning(
+                f"[VALIDATE] {flatline_count} station(s) flagged FLATLINE "
+                f"(API unchanged for 6 consecutive hours)"
+            )
+
+        # Spike detection — API changes by > 50 between this hour and the
+        # immediately previous hour for the same station. Both directions are
+        # flagged: a sudden jump up suggests a sensor glitch or a real episode
+        # spike (worth a second look either way), and a sudden drop > 50
+        # suggests a sensor reset or maintenance event. Strict inequality:
+        # exactly 50 is NOT flagged. Requires the prior row to be at exactly
+        # t-1h; if there's a gap, we cannot infer an hourly jump.
+        spike_count = 0
+        for station_id, current_rows in df.groupby("STATION_ID"):
+            current_row = current_rows.iloc[0]
+            current_api = current_row["API"]
+            current_hour = current_row["HOUR_MYT"]
+
+            if pd.isna(current_api):
+                continue
+
+            prev_hour = current_hour - pd.Timedelta(hours=1)
+            prev_rows = history[
+                (history["STATION_ID"] == station_id) &
+                (history["HOUR_MYT"] == prev_hour)
+            ]
+            if prev_rows.empty:
+                continue  # no row at exactly t-1h
+
+            prev_api = prev_rows["API"].iloc[0]
+            if pd.isna(prev_api):
+                continue
+
+            if abs(current_api - prev_api) > 50:
+                df.loc[df["STATION_ID"] == station_id, "DATA_FLAG"] += "SPIKE;"
+                spike_count += 1
+
+        if spike_count:
+            logger.warning(
+                f"[VALIDATE] {spike_count} station(s) flagged SPIKE "
+                f"(API change > 50 from previous hour)"
+            )
+
     flagged = (df["DATA_FLAG"] != "").sum()
     if flagged:
         logger.warning(f"[VALIDATE] Total flagged rows this snapshot: {flagged}")
@@ -521,6 +623,7 @@ def save_snapshot(df: pd.DataFrame) -> None:
     logger = logging.getLogger("pipeline")
 
     out_path = os.path.normpath(TIMESERIES_PATH)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     if os.path.exists(out_path):
         existing = pd.read_csv(out_path, parse_dates=["HOUR_MYT"])
@@ -536,7 +639,7 @@ def save_snapshot(df: pd.DataFrame) -> None:
 
     combined.to_csv(out_path, index=False)
     logger.info(
-        f"[SAVE] Snapshot appended → {out_path} "
+        f"[SAVE] Snapshot appended -> {out_path} "
         f"| new rows: {len(df)} | deduped: {before - after} | total: {after}"
     )
     print(f"[SAVE] merged_timeseries.csv now has {after} rows.")

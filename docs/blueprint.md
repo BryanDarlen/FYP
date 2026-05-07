@@ -32,7 +32,8 @@ https://eqms.doe.gov.my/api3/publicportalapims/apitablehourly?stateid=1&datetime
 https://www.met.gov.my/json/cuaca_semasa/data.json  (In UTC Timestamp) (Updated to Latest) (Maybe can adjust to APIMS by decreasing the timestamp automatically like “data.json?timestamp=____” ?)
 
 - NASA FIRMS:
-https://firms.modaps.eosdis.nasa.gov/api/area/csv/a6e0bf01039373b8f5e8fac03b4533a1/VIIRS_SNPP_NRT/99,0.8,119.5,7.6/1
+https://firms.modaps.eosdis.nasa.gov/api/area/csv/<MAP_KEY>/VIIRS_SNPP_NRT/95,-6,119.5,7.6/1
+(MAP_KEY is loaded from a local `.env` file at runtime — never committed. Bounding box widened from `99,0.8,119.5,7.6` to `95,-6,119.5,7.6` to include all of Sumatra and Indonesian Borneo, the main transboundary haze source regions per ASMC.)
 
 # WHY PEOPLE NEED INTEGRATE APIMS + METMALAYSIA WEATHER + NASA FIRMS INTO ONE PIPELINE? (DATA CLEANING, JOINING & AUTOMATION)
 Yes, people do need it, especially in Malaysia/ASEAN where air quality can change quickly during haze/fire episodes.

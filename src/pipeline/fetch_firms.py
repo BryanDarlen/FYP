@@ -14,6 +14,13 @@ import os
 import httpx
 import pandas as pd
 import io
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from the project root .env file (if present).
+# fetch_firms.py lives at <project_root>/src/pipeline/, so parents[2] is root.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 OUTPUT_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "outputs")
@@ -29,12 +36,30 @@ from datetime import datetime, timezone, timedelta
 # Stores the full endpoint link that will be called to download
 # NASA FIRMS VIIRS SNPP Near Real-Time fire hotspot data in CSV format.
 
-# NASA FIRMS – VIIRS SNPP Near Real-Time hotspots over Malaysia bounding box
-# Bounding box: West=99, South=0.8, East=119.5, North=7.6 | 1 day lookback
+# NASA FIRMS – VIIRS SNPP Near Real-Time hotspots over the regional study area.
+#
+# Bounding box: West=95, South=-6, East=119.5, North=7.6  | 1 day lookback
+# Covers: Peninsular Malaysia, Sabah, Sarawak, all of Sumatra, all of Kalimantan.
+# Rationale: Malaysia's worst haze episodes are driven by transboundary smoke
+# from fires in Sumatra (esp. Riau ~0.3°N) and Kalimantan (4°S to 4°N),
+# both of which fall well below the previous 0.8°N southern bound and so
+# were silently excluded. ASMC monitors the same two sub-regions for ASEAN
+# regional haze (https://asmc.asean.org/asmc-haze-hotspot-annual-new/).
+#
+# The MAP_KEY is read from the FIRMS_MAP_KEY environment variable (loaded
+# from .env at project root). Get a free key at:
+#   https://firms.modaps.eosdis.nasa.gov/api/map_key/
+FIRMS_MAP_KEY = os.environ.get("FIRMS_MAP_KEY")
+if not FIRMS_MAP_KEY:
+    raise RuntimeError(
+        "FIRMS_MAP_KEY is not set. Copy .env.example to .env and fill in "
+        "your FIRMS MAP_KEY (free at https://firms.modaps.eosdis.nasa.gov/api/map_key/)."
+    )
+
 FIRMS_URL = (
-    "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
-    "/a6e0bf01039373b8f5e8fac03b4533a1"
-    "/VIIRS_SNPP_NRT/99,0.8,119.5,7.6/1"
+    f"https://firms.modaps.eosdis.nasa.gov/api/area/csv"
+    f"/{FIRMS_MAP_KEY}"
+    f"/VIIRS_SNPP_NRT/95,-6,119.5,7.6/1"
 )
 
 # Malaysia Time offset (UTC+8) — used to align all timestamps to MYT
@@ -75,7 +100,8 @@ async def fetch_firms_data() -> str:
 # ---------------------------------------------------------------------------
 # Parses the CSV text into a DataFrame, keeps important columns,
 # converts acquisition date + time to MYT datetime, converts numeric
-# fields to correct types, filters to Malaysia bounding box,
+# fields to correct types, filters to the regional study area
+# (Malaysia + Sumatra + Kalimantan, matching the FIRMS URL bbox),
 # and removes duplicates.
 
 # ---------------------------------------------------------------------------
@@ -144,12 +170,17 @@ def preprocess_firms(raw_csv: str) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # 7: Filter hotspot records to the Malaysia study area
-    # This step keeps records within the predefined coordinate range
-    # used to represent the study area of Malaysia.
+    # 7: Filter hotspot records to the regional study area
+    # The study area covers Malaysia plus the two main transboundary haze
+    # source regions (Sumatra and Kalimantan), since Malaysia's worst haze
+    # episodes are driven by smoke from those Indonesian provinces rather
+    # than by domestic fires alone. Bounds match the FIRMS API URL above.
+    #   Sumatra:    ~6°N to ~6°S, ~95°E to ~106°E
+    #   Kalimantan: ~4°N to ~4°S, ~108°E to ~119°E
+    #   Malaysia:   ~1°N to ~7°N, ~99°E to ~119°E
     df = df[
-        (df["LATITUDE"] >= 1.0) & (df["LATITUDE"] <= 7.0) &
-        (df["LONGITUDE"] >= 100.0) & (df["LONGITUDE"] <= 119.0)
+        (df["LATITUDE"]  >= -6.0) & (df["LATITUDE"]  <= 7.6) &
+        (df["LONGITUDE"] >= 95.0) & (df["LONGITUDE"] <= 119.5)
     ].copy()
 
 

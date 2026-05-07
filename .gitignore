@@ -1,0 +1,39 @@
+# --- Secrets / local config ---
+.env
+.env.local
+*.key
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# --- Runtime logs / generated ML artefacts ---
+data/logs/
+src/models/forecast_model.pkl
+src/models/feature_columns.json
+src/models/eval_report.json
+src/models/baseline_report.json
+src/models/shap_global_importance.json
+data/processed/_test_backup/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Office lock files (auto-created when a doc is open) ---
+~$*.docx
+~$*.doc
+~$*.xlsx
+~$*.pptx
+
+# --- Data artefacts (uncomment if you don't want raw data tracked) ---
+# data/raw/
+# data/outputs/

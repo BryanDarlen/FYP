@@ -22,6 +22,7 @@ src/models/baseline_report.json
 src/models/shap_global_importance.json
 data/processed/_test_backup/
 data/processed/*history_preview*.csv
+data/processed/merged_timeseries.csv
 
 # --- Editors / OS ---
 .vscode/

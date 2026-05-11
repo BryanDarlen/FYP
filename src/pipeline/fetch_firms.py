@@ -21,7 +21,7 @@ from typing import Optional
 # Load environment variables from the project root .env file (if present).
 # fetch_firms.py lives at <project_root>/src/pipeline/, so parents[2] is root.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(PROJECT_ROOT / ".env", override=True)
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 OUTPUT_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "outputs")
@@ -51,11 +51,18 @@ from datetime import datetime, timezone, timedelta
 # from .env at project root). Get a free key at:
 #   https://firms.modaps.eosdis.nasa.gov/api/map_key/
 FIRMS_MAP_KEY = os.environ.get("FIRMS_MAP_KEY")
-if not FIRMS_MAP_KEY:
-    raise RuntimeError(
-        "FIRMS_MAP_KEY is not set. Copy .env.example to .env and fill in "
-        "your FIRMS MAP_KEY (free at https://firms.modaps.eosdis.nasa.gov/api/map_key/)."
-    )
+
+
+def get_firms_map_key() -> str:
+    """Return a real FIRMS key or raise a clear runtime error."""
+    key = (FIRMS_MAP_KEY or "").strip()
+    if not key or key == "your_firms_key_here":
+        raise RuntimeError(
+            "FIRMS_MAP_KEY is not set to a real key. Edit .env and replace "
+            "your_firms_key_here with your FIRMS MAP_KEY "
+            "(free at https://firms.modaps.eosdis.nasa.gov/api/map_key/)."
+        )
+    return key
 
 FIRMS_SOURCE = "VIIRS_SNPP_NRT"
 FIRMS_AREA = "95,-6,119.5,7.6"
@@ -71,7 +78,7 @@ def build_firms_url(day_range: int = 1, start_date: Optional[str] = None) -> str
     """
     url = (
         f"https://firms.modaps.eosdis.nasa.gov/api/area/csv"
-        f"/{FIRMS_MAP_KEY}"
+        f"/{get_firms_map_key()}"
         f"/{FIRMS_SOURCE}/{FIRMS_AREA}/{day_range}"
     )
     if start_date:
@@ -79,7 +86,7 @@ def build_firms_url(day_range: int = 1, start_date: Optional[str] = None) -> str
     return url
 
 
-FIRMS_URL = build_firms_url()
+FIRMS_URL = None
 
 # Malaysia Time offset (UTC+8) — used to align all timestamps to MYT
 MYT_OFFSET = timedelta(hours=8)

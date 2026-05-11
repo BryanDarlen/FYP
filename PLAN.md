@@ -37,7 +37,9 @@
 ### PHASE 2 — Build a Historical Time Series Dataset
 **Why:** The current pipeline only captures a single snapshot. The forecasting model needs continuous hourly data over weeks/months to learn patterns and to be tested on haze vs. normal days.
 
-**Storage decision:** CSV (`data/processed/merged_timeseries.csv`) — not SQLite — for the FYP. Simpler to inspect, version, and load with `pandas`. Migrate to SQLite only if file grows past ~100 MB.
+**Forecasting context required by the FYP:** Each prediction row should be able to use the current hour plus previous context at `t-1h`, `t-2h`, `t-3h`, `t-6h`, `t-12h`, and `t-24h`. `merged_timeseries.csv` is the operational time-series context for this forecasting system: it can keep changing over time as the latest current-hour snapshot arrives, while retaining the previous 1-24h rows needed for feature engineering. For immediate warm-up, available historical endpoints may initialise this recent context, but those rows must remain clearly flagged.
+
+**Storage decision:** CSV (`data/processed/merged_timeseries.csv`) — not SQLite — for the FYP. Simpler to inspect, version, and load with `pandas`. This file is the operational forecasting context, not a static one-off snapshot. Migrate to SQLite only if file grows past ~100 MB.
 
 **Already implemented (Phase 1 → 2 carry-over):**
 - [x] Hourly scheduler — `src/pipeline/scheduler.py` runs `fetch → merge → validate → save` every 60 minutes.
@@ -46,11 +48,14 @@
 - [x] **End-to-end smoke test** — verified scheduler runs cleanly through one full cycle: APIMS (68 rows) + METMalaysia (16 rows) + FIRMS, merge, validate, save. CSV at `data/processed/merged_timeseries.csv` confirmed to have all 19 expected columns (incl. `_100KM` station-local FIRMS) and `DATA_FLAG` clean for normal operation.
 
 **Remaining tasks:**
+- [x] **Scheduler restart catch-up** - `scheduler.py` now checks the latest 24 completed hours before each live run. Missing completed hours are backfilled from APIMS hourly history + WIS2 SYNOP observations + NASA FIRMS history, filtered by missing `STATION_ID + HOUR_MYT`, and flagged with `SCHEDULER_CATCHUP;`. Live/current collection still runs afterward. Verified on 2026-05-08 by filling 8 missing hours (`2026-05-08 00:00:00` to `2026-05-08 07:00:00`) with 544 rows.
 - [ ] **Run the scheduler continuously for ≥ 2–4 weeks** to accumulate training data. Target: capture at least one haze episode (API > 100 at any station). Indonesia's typical fire/haze season is July–October per ASMC — collection started outside this window will produce a "clean-only" dataset, which is fine for baseline accuracy but won't test haze-event behaviour.
 - [x] **Add flatline detection** to `validate_snapshot()`: flag stations whose API value is unchanged for ≥ 6 consecutive hours (likely sensor stuck). Append `FLATLINE;` to `DATA_FLAG`. ✅ Done — implemented in `pipeline_merge.py`; requires both identical API across 5 priors AND truly consecutive hours (no gaps). Verified with synthetic test covering stuck/gap/changing/new-station scenarios.
 - [x] **Add spike detection** to `validate_snapshot()`: flag rows where API jumps by > 50 from the previous hour for the same station. Append `SPIKE;` to `DATA_FLAG`. ✅ Done — implemented in `pipeline_merge.py`; uses `abs(current - prev) > 50` to flag both up- and down-spikes; requires the prior row at *exactly* `t-1h` (no flag if there's a gap). Verified with 9-scenario test including boundary case (exactly 50 → not flagged) and flatline regression.
 - [x] **(History helper)** — flatline and spike checks need access to the previous N hours, so they must read from `merged_timeseries.csv` *before* appending the new snapshot. ✅ Done — `_load_recent_history()` helper in `pipeline_merge.py`; spike detection will reuse it.
-- [x] **(Controlled history preview)** — `pipeline_merge.py --history-preview` can now create a preview from APIMS recent hourly history, WIS2 historical SYNOP station observations, and NASA FIRMS historical date-window data without changing `merged_timeseries.csv`. WIS2 is a separate observation product from METMalaysia `data.json`, so rows are flagged as `WIS2_SYNOP_OBSERVED;`. Verified for state 1 at `2026-05-07 15:00`: 200 rows, 8 stations, 25 hours, 0 missing weather fields, and 8 engineered rows after Phase 3 feature engineering.
+- [x] **(Controlled history preview / warm-up)** — `pipeline_merge.py --history-preview` can prepare the required current + previous 1-24h context from APIMS recent hourly history, WIS2 historical SYNOP station observations, and NASA FIRMS historical date-window data. After review, `pipeline_merge.py --init-timeseries-from-preview` can initialise the operational `merged_timeseries.csv` context while preserving existing scheduler/live rows on overlap. WIS2 is a separate observation product from METMalaysia `data.json`, so rows are flagged as `WIS2_SYNOP_OBSERVED;`. Verified on 2026-05-08: operational `merged_timeseries.csv` now has 5,034 rows, 68 stations, 74 unique hours, and range `2026-05-04 23:00:00` to `2026-05-08 08:00:00`; default Phase 3 generated 3,402 rows in `features.csv`.
+
+**Latest verified operational dataset after catch-up (2026-05-08):** `merged_timeseries.csv` has 5,646 rows, 68 stations, and range `2026-05-04 23:00:00` to `2026-05-08 09:00:00`; default Phase 3 generated 4,014 rows in `features.csv`.
 
 **Output:** A CSV table with 19 columns:
 `STATION_ID, STATION_LOCATION, STATE_NAME, LATITUDE, LONGITUDE, HOUR_MYT, API, CLASS, TEMPERATURE_C, RAIN_FORECAST_SLOTS, HOTSPOT_COUNT, FRP_MW_MEAN, FRP_MW_MAX, HIGH_CONF_COUNT, HOTSPOT_COUNT_100KM, FRP_MW_MEAN_100KM, FRP_MW_MAX_100KM, HIGH_CONF_COUNT_100KM, DATA_FLAG`
@@ -123,12 +128,12 @@ Using one function for both prevents train/serve skew (the most common silent bu
 The standalone `src/pipeline/scheduler.py` (Phase 2) runs the data-collection loop in its own process. In Phase 5, that loop **moves inside the FastAPI app** via APScheduler — so a single `uvicorn` process serves the API *and* runs the hourly pipeline + prediction step. After Phase 5 is working, `scheduler.py` becomes redundant and should be deleted (or kept only as a fallback for offline data collection without the API).
 
 **Tasks:**
-- [ ] Set up FastAPI app with Uvicorn (`uvicorn src.api.main:app --reload`).
-- [ ] Configure APScheduler (`AsyncIOScheduler`) inside the FastAPI app's startup event to run `fetch → merge → validate → save → build_features → predict` every **60 minutes**. Reuse the same `run_once()` logic that's in `scheduler.py` today.
-- [ ] At app startup, `joblib.load('src/models/forecast_model.pkl')` once and keep it in memory — never reload per request.
-- [ ] Store the latest merged + predicted result in SQLite (`data/airquality.db`) AND as a JSON file (`data/cache/latest.json`) for offline fallback. JSON is the source of truth for the `/latest` endpoint; SQLite is for historical queries by the dashboard's trend chart.
-- [ ] After Phase 5 is verified, **delete `src/pipeline/scheduler.py`** to avoid two competing schedulers.
-- [ ] Implement these endpoints:
+- [x] Set up FastAPI app with Uvicorn (`python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8010 --reload`). Done in `src/api/main.py`. The explicit localhost/port command avoids the Windows `[WinError 10013]` socket issue seen with the default command.
+- [x] Configure an hourly in-process background refresh loop to run `catch-up → fetch → merge → validate → save → build_features → cache` every **60 minutes**. It reuses the same catch-up and `run_once()` logic from `scheduler.py`. APScheduler is not installed in the current environment, so this uses an `asyncio` loop for now.
+- [x] At app startup, `joblib.load('src/models/forecast_model.pkl')` once and keep it in memory — never reload per request.
+- [x] Store the latest merged result in SQLite (`data/airquality.db`) AND as a JSON file (`data/cache/latest.json`) for offline fallback. JSON is the source of truth for the `/latest` endpoint; SQLite is prepared for dashboard/history use.
+- [ ] After Phase 5 is fully verified with the frontend, decide whether to delete `src/pipeline/scheduler.py` or keep it as a fallback collector. For now, keep it because the user specifically needs restart catch-up when running the script directly.
+- [x] Implement these endpoints:
 
 | Endpoint | Returns |
 |----------|---------|
@@ -138,8 +143,8 @@ The standalone `src/pipeline/scheduler.py` (Phase 2) runs the data-collection lo
 | `GET /explain/{station_id}` | Plain-language cause explanation for a station |
 | `GET /status` | Last updated timestamp + data freshness flag |
 
-- [ ] Serve the HTML dashboard as a static file from the same FastAPI app (`/` route)
-- [ ] Enable CORS so the browser can call the endpoints
+- [x] Serve the HTML dashboard as a static file from the same FastAPI app (`/` route). Done in Phase 6 with `src/api/static/index.html`.
+- [x] Enable CORS so the browser can call the endpoints.
 
 **Offline mode logic (in the `/latest` and `/status` endpoints):**
 - If the last successful fetch was > 2 hours ago, include `"stale": true` and `"last_updated": "..."` in the response
@@ -187,8 +192,35 @@ The standalone `src/pipeline/scheduler.py` (Phase 2) runs the data-collection lo
 **Frontend stack:**
 - Plain HTML + CSS + vanilla JavaScript (no framework needed)
 - `fetch()` polling every 60 seconds to refresh data
-- Chart.js for time series graphs
-- Leaflet.js (optional) for map view of stations
+- Native canvas charts for trend/forecast graphs
+- Leaflet/OpenStreetMap station map with a coordinate fallback if map tiles are unavailable
+
+**Phase 6 implementation status:**
+- [x] `src/api/static/index.html`
+- [x] `src/api/static/style.css`
+- [x] `src/api/static/app.js`
+- [x] Dashboard served at `/`
+- [x] API docs remain available at `/docs`
+- [x] Station map/list uses `GET /latest`; map is constrained to the project map extent so users cannot drag out of bounds.
+- [x] Last-12-hour trend uses `GET /history/{station_id}`
+- [x] Forecast chart uses `GET /forecast/{station_id}`
+- [x] Alert panel uses `GET /alerts`
+- [x] Explanation panel uses `GET /explain/{station_id}`
+- [x] Offline/stale banner uses `/latest.status` and `/status`
+- [x] Station detail now shows explicit NASA FIRMS evidence: regional hotspot count, regional max FRP, local 100 km hotspot count, and local max FRP.
+- [x] `GET /explain/{station_id}` now returns structured `firms_evidence`, and the Why panel shows whether NASA FIRMS is direct nearby fire evidence, weaker regional context, or not currently supporting a fire-driven explanation.
+- [x] Station clicks and refresh are more responsive: station detail renders immediately, trend/forecast/Why load in the background, latest feature rows and per-station forecasts are cached, `/explain/{station_id}` is cached per station/hour, and fast precomputed model feature evidence is used by default instead of slow local SHAP on every click.
+- [x] Dashboard columns are constrained against station-change expansion: panels/cards/details use `min-width: 0`, `max-width: 100%`, defensive text wrapping, fixed grid behavior, and active map markers scale via transform instead of changing layout dimensions.
+- [x] Detail metric cards are fixed-format: the Rain Slots / Local Hotspots / Wind cards have a fixed row height, single-line labels and values, hidden overflow, tabular numeric values, and shortened numeric formatting so station changes cannot resize that block.
+- [x] Last-12-hours and Forecast canvases are fixed-format: visible chart heights are locked at 170px and 190px while the internal canvas buffer still scales for device-pixel-ratio rendering.
+- [x] Last-12-hours and Forecast blocks now include simple station-specific summaries: observed APIMS trend/range for recent history and model forecast peak/final-horizon interpretation for future API estimates.
+- [x] Starting the FastAPI backend schedules an immediate background live refresh; opening the dashboard also schedules one if needed. The dashboard polls quickly during the first 2 minutes, and `/latest` refreshes from `merged_timeseries.csv` before falling back to cache.
+- [ ] Wind direction arrow remains unavailable until a wind-direction source/column is added; the dashboard shows `N/A` instead of inventing wind data.
+- [ ] Forecast confidence band remains future work; the current model outputs point forecasts only.
+
+**Near-term accuracy follow-ups if time allows:**
+- **Wind direction:** Add only after the pipeline has a real wind-direction field from an official source. Possible implementation path: fetch wind direction/speed from a suitable METMalaysia/WIS2 observation field, store it in `merged_timeseries.csv`, include it in `features.csv` if useful, and then replace the dashboard's `N/A` wind display with the actual direction arrow. Do not infer wind direction from station location or hotspot position.
+- **Forecast confidence band:** Add only after defining a defensible uncertainty method. Possible implementation path: use per-tree RandomForest prediction spread or quantile-style prediction intervals, expose lower/median/upper values from `/forecast/{station_id}`, and then draw the shaded band on the dashboard. Do not show a decorative confidence band without model-derived uncertainty values.
 
 ---
 
@@ -247,10 +279,10 @@ The standalone `src/pipeline/scheduler.py` (Phase 2) runs the data-collection lo
 |-------|-------------|--------|
 | 1 | Data pipeline: fetch, clean, merge (one snapshot) | ✅ Done |
 | 2 | Historical time series collection (hourly append, 2–4 weeks) | 🟡 In progress — **all code complete** (scheduler, append, all 5 validation flags, end-to-end smoke test passed). Only remaining task: leave the scheduler running for ≥ 2–4 weeks to accumulate training data. |
-| 3 | Feature engineering (lags, rolling avg, time features, fire-weather interaction) | ✅ Code complete — `feature_engineering.py` ready; will populate `features.csv` once ≥25h of data per station accumulates |
-| 4 | ML model training, evaluation, SHAP explainability | ✅ Code complete — `train.py` ready; produces 5 artefacts under `src/models/` once `features.csv` exists |
+| 3 | Feature engineering (lags, rolling avg, time features, fire-weather interaction) | ✅ Code complete — `feature_engineering.py` ready for scheduler data and supports `--history-preview` for the separate WIS2/APIMS/FIRMS historical preview |
+| 4 | ML model training, evaluation, SHAP explainability | ✅ Code complete — `train.py` ready for scheduler features and supports `--history-preview` to write temporary artefacts under `data/outputs/preview_model/` |
 | 5 | FastAPI backend (scheduler, SQLite, endpoints, offline cache) | ⬜ Not started |
-| 6 | HTML dashboard (map, forecast chart, alerts, cause explanation, offline banner) | ⬜ Not started |
+| 6 | HTML dashboard (map, forecast chart, alerts, cause explanation, offline banner) | 🟨 In progress - dashboard implemented |
 | 7 | Testing: forecast accuracy, offline mode, alert thresholds, stress test | ⬜ Final evaluation not started; current synthetic/unit smoke tests pass (`python tests/run_all.py`) |
 
 ---

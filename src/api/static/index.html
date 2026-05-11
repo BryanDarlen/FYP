@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Malaysia Air Quality Forecast</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <h1>Malaysia Air Quality Forecast</h1>
+        <p id="last-updated">Loading latest update...</p>
+      </div>
+      <div class="status-strip">
+        <div class="metric">
+          <span>Stations</span>
+          <strong id="station-count">--</strong>
+        </div>
+        <div class="metric">
+          <span>Alerts</span>
+          <strong id="alert-count">--</strong>
+        </div>
+        <button id="refresh-button" type="button">Refresh</button>
+      </div>
+    </header>
+
+    <div id="offline-banner" class="offline-banner" hidden></div>
+
+    <main class="dashboard-grid">
+      <section class="panel map-panel" aria-label="Station map">
+        <div class="panel-header">
+          <h2>Current Conditions</h2>
+          <select id="state-filter" aria-label="State filter">
+            <option value="all">All states</option>
+          </select>
+        </div>
+        <div class="map-wrap">
+          <div class="map-backdrop" id="station-map"></div>
+        </div>
+      </section>
+
+      <aside class="panel station-panel" aria-label="Station list">
+        <div class="panel-header compact">
+          <h2>Stations</h2>
+          <input id="station-search" type="search" placeholder="Search station">
+        </div>
+        <div id="station-list" class="station-list"></div>
+      </aside>
+
+      <section class="panel detail-panel" aria-label="Station detail">
+        <div class="detail-heading">
+          <div>
+            <h2 id="detail-name">Select a station</h2>
+            <p id="detail-state">--</p>
+          </div>
+          <div class="api-badge" id="detail-api">--</div>
+        </div>
+
+        <div class="detail-metrics">
+          <div>
+            <span>Rain Slots</span>
+            <strong id="detail-rain">--</strong>
+          </div>
+          <div>
+            <span>Local Hotspots</span>
+            <strong id="detail-hotspots">--</strong>
+          </div>
+          <div>
+            <span>Wind</span>
+            <strong id="detail-wind">N/A</strong>
+          </div>
+        </div>
+
+        <div class="firms-block" aria-label="NASA FIRMS evidence">
+          <div class="firms-heading">
+            <h3>NASA FIRMS</h3>
+            <span id="firms-status">--</span>
+          </div>
+          <div class="firms-grid">
+            <div>
+              <span>Regional hotspots</span>
+              <strong id="firms-regional-count">--</strong>
+            </div>
+            <div>
+              <span>Regional max FRP</span>
+              <strong id="firms-regional-frp">--</strong>
+            </div>
+            <div>
+              <span>Within 100 km</span>
+              <strong id="firms-local-count">--</strong>
+            </div>
+            <div>
+              <span>Local max FRP</span>
+              <strong id="firms-local-frp">--</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="chart-block">
+          <div class="panel-header compact">
+            <h3>Last 12 Hours</h3>
+            <div class="segmented" role="group" aria-label="Trend mode">
+              <button class="trend-mode active" data-mode="raw" type="button">Raw</button>
+              <button class="trend-mode" data-mode="roll3" type="button">3h</button>
+              <button class="trend-mode" data-mode="roll12" type="button">12h</button>
+            </div>
+          </div>
+          <canvas id="trend-chart" data-chart-height="170"></canvas>
+          <p id="trend-summary" class="chart-summary">--</p>
+        </div>
+
+        <div class="chart-block">
+          <h3>Forecast</h3>
+          <canvas id="forecast-chart" data-chart-height="190"></canvas>
+          <p id="forecast-summary" class="chart-summary">--</p>
+        </div>
+      </section>
+
+      <section class="panel alert-panel" aria-label="Alerts">
+        <div class="panel-header compact">
+          <h2>Alerts</h2>
+          <span id="alert-updated">--</span>
+        </div>
+        <div id="alerts-list" class="alerts-list"></div>
+      </section>
+
+      <section class="panel explain-panel" aria-label="Explanation">
+        <h2>Why</h2>
+        <p id="explanation-text">--</p>
+        <div id="feature-list" class="feature-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

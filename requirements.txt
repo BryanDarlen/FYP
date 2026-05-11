@@ -19,6 +19,5 @@ scikit-learn==1.8.0       # RandomForestRegressor, MultiOutputRegressor
 joblib==1.5.3             # model persistence
 shap==0.51.0              # explainability
 
-# --- Phase 5 (FastAPI backend) — uncomment when starting Phase 5 ---
-# uvicorn==0.30.6         # ASGI server for FastAPI
-# apscheduler==3.10.4     # in-process hourly job
+# --- Phase 5 (FastAPI backend) ---
+uvicorn==0.30.6           # ASGI server for FastAPI

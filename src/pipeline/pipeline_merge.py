@@ -895,6 +895,68 @@ def save_snapshot(df: pd.DataFrame) -> None:
     print(f"[SAVE] merged_timeseries.csv now has {after} rows.")
 
 
+def initialize_timeseries_from_history_preview(
+    preview_path: str = HISTORY_PREVIEW_PATH,
+    timeseries_path: str = TIMESERIES_PATH,
+) -> pd.DataFrame:
+    """
+    Initialise/update merged_timeseries.csv from a reviewed history preview.
+
+    Preview rows provide the current + previous 1-24h forecasting context
+    immediately. Existing scheduler-collected rows are kept when the same
+    STATION_ID + HOUR_MYT already exists, so live observations are not
+    overwritten by backfilled rows.
+    """
+    preview_path = os.path.normpath(preview_path)
+    timeseries_path = os.path.normpath(timeseries_path)
+
+    if not os.path.exists(preview_path):
+        raise FileNotFoundError(f"History preview not found: {preview_path}")
+
+    preview = pd.read_csv(preview_path, parse_dates=["HOUR_MYT"])
+    if preview.empty:
+        raise ValueError(f"History preview is empty: {preview_path}")
+    if not {"STATION_ID", "HOUR_MYT"}.issubset(preview.columns):
+        raise ValueError("History preview must contain STATION_ID and HOUR_MYT columns.")
+
+    os.makedirs(os.path.dirname(os.path.abspath(timeseries_path)), exist_ok=True)
+    if os.path.exists(timeseries_path):
+        existing = pd.read_csv(timeseries_path, parse_dates=["HOUR_MYT"])
+    else:
+        existing = pd.DataFrame(columns=preview.columns)
+
+    before_existing = len(existing)
+    before_preview = len(preview)
+
+    # Preview first, existing second: existing live rows win on overlap.
+    combined = pd.concat([preview, existing], ignore_index=True, sort=False)
+    before_dedup = len(combined)
+    combined.drop_duplicates(subset=["STATION_ID", "HOUR_MYT"], keep="last", inplace=True)
+    combined.sort_values(["STATION_ID", "HOUR_MYT"], inplace=True)
+    combined.reset_index(drop=True, inplace=True)
+    combined.to_csv(timeseries_path, index=False)
+
+    after = len(combined)
+    print(f"[INIT] Preview input       : {preview_path}")
+    print(f"[INIT] Timeseries output   : {timeseries_path}")
+    print(f"[INIT] Existing rows       : {before_existing:,}")
+    print(f"[INIT] Preview rows        : {before_preview:,}")
+    print(f"[INIT] Deduped rows        : {before_dedup - after:,}")
+    print(f"[INIT] Added rows          : {after - before_existing:,}")
+    print(f"[INIT] Final rows          : {after:,}")
+    print(f"[INIT] Stations            : {combined['STATION_ID'].nunique()}")
+    print(f"[INIT] Hours               : {combined['HOUR_MYT'].nunique()}")
+    print(f"[INIT] Range               : {combined['HOUR_MYT'].min()} -> {combined['HOUR_MYT'].max()}")
+    if "DATA_FLAG" in combined.columns:
+        print("[INIT] DATA_FLAG counts:")
+        flag_counts = combined["DATA_FLAG"].fillna("").astype(str).value_counts()
+        for flag, count in flag_counts.items():
+            label = flag if flag else "(clean/live)"
+            print(f"[INIT]   {label}: {count}")
+
+    return combined
+
+
 # =============================================================================
 # ── QUICK TEST (run directly: python data_pipeline_merge.py) ─────────────────
 # =============================================================================
@@ -909,6 +971,14 @@ if __name__ == "__main__":
         "--history-preview",
         action="store_true",
         help="Build a multi-source historical preview CSV without changing merged_timeseries.csv.",
+    )
+    parser.add_argument(
+        "--init-timeseries-from-preview",
+        action="store_true",
+        help=(
+            "Initialise/update merged_timeseries.csv from a reviewed history "
+            "preview, keeping existing live rows on overlap."
+        ),
     )
     parser.add_argument(
         "--datetime",
@@ -926,6 +996,16 @@ if __name__ == "__main__":
         default=HISTORY_PREVIEW_PATH,
         help="Output CSV path for --history-preview mode.",
     )
+    parser.add_argument(
+        "--preview-input",
+        default=HISTORY_PREVIEW_PATH,
+        help="Input CSV path for --init-timeseries-from-preview mode.",
+    )
+    parser.add_argument(
+        "--timeseries-output",
+        default=TIMESERIES_PATH,
+        help="Output CSV path for --init-timeseries-from-preview mode.",
+    )
     args = parser.parse_args()
 
     if args.history_preview:
@@ -934,6 +1014,13 @@ if __name__ == "__main__":
             state_ids=parse_state_ids(args.state_ids),
         ))
         save_history_preview(preview_df, args.output)
+        sys.exit(0)
+
+    if args.init_timeseries_from_preview:
+        initialize_timeseries_from_history_preview(
+            preview_path=args.preview_input,
+            timeseries_path=args.timeseries_output,
+        )
         sys.exit(0)
 
     async def run_test():

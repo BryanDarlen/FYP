@@ -15,6 +15,8 @@ TEST_FILES = [
     "test_validation.py",
     "test_features.py",
     "test_train.py",
+    "test_scheduler_catchup.py",
+    "test_api.py",
 ]
 
 

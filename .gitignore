@@ -23,6 +23,10 @@ src/models/shap_global_importance.json
 data/processed/_test_backup/
 data/processed/*history_preview*.csv
 data/processed/merged_timeseries.csv
+data/processed/features*.csv
+data/outputs/preview_model/
+data/cache/
+data/airquality.db
 
 # --- Editors / OS ---
 .vscode/

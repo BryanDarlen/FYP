@@ -34,6 +34,7 @@ Design choices (locked per PLAN.md):
 
 import json
 import sys
+import argparse
 from pathlib import Path
 
 import joblib
@@ -52,6 +53,7 @@ from sklearn.multioutput import MultiOutputRegressor
 PROJECT_ROOT      = Path(__file__).resolve().parents[2]
 FEATURES_PATH     = PROJECT_ROOT / "data" / "processed" / "features.csv"
 MODELS_DIR        = PROJECT_ROOT / "src" / "models"
+PREVIEW_MODELS_DIR = PROJECT_ROOT / "data" / "outputs" / "preview_model"
 MODEL_PATH        = MODELS_DIR / "forecast_model.pkl"
 FEATURE_COLS_PATH = MODELS_DIR / "feature_columns.json"
 EVAL_REPORT_PATH  = MODELS_DIR / "eval_report.json"
@@ -180,14 +182,50 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, horizons: list[int]) -> dic
 # ----- Main ------------------------------------------------------------------
 
 def main() -> None:
-    if not FEATURES_PATH.exists():
-        print(f"[TRAIN] features.csv not found at {FEATURES_PATH}")
+    parser = argparse.ArgumentParser(description="Train the API forecasting model.")
+    parser.add_argument(
+        "--features",
+        default=str(FEATURES_PATH),
+        help="Input features CSV. Defaults to data/processed/features.csv.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(MODELS_DIR),
+        help="Directory for trained model artefacts. Defaults to src/models.",
+    )
+    parser.add_argument(
+        "--history-preview",
+        action="store_true",
+        help=(
+            "Use data/processed/features_history_preview.csv and save artefacts "
+            "under data/outputs/preview_model."
+        ),
+    )
+    args = parser.parse_args()
+
+    features_path = (
+        PROJECT_ROOT / "data" / "processed" / "features_history_preview.csv"
+        if args.history_preview else Path(args.features)
+    )
+    models_dir = PREVIEW_MODELS_DIR if args.history_preview else Path(args.output_dir)
+    model_path = models_dir / "forecast_model.pkl"
+    feature_cols_path = models_dir / "feature_columns.json"
+    eval_report_path = models_dir / "eval_report.json"
+    baseline_path = models_dir / "baseline_report.json"
+    shap_report_path = models_dir / "shap_global_importance.json"
+
+    if not features_path.exists():
+        print(f"[TRAIN] features.csv not found at {features_path}")
         print("[TRAIN] Run feature engineering first:")
         print("[TRAIN]   python src/pipeline/feature_engineering.py")
+        print("[TRAIN] Or for the controlled historical preview:")
+        print("[TRAIN]   python src/pipeline/feature_engineering.py --history-preview")
         sys.exit(0)
 
-    print(f"[TRAIN] Loading {FEATURES_PATH.name} ...")
-    df = pd.read_csv(FEATURES_PATH, parse_dates=["HOUR_MYT"])
+    print(f"[TRAIN] Loading {features_path.name} ...")
+    if args.history_preview:
+        print("[TRAIN]   Mode           : controlled historical preview/backfill")
+    df = pd.read_csv(features_path, parse_dates=["HOUR_MYT"])
     print(f"[TRAIN]   Rows           : {len(df):,}")
     print(f"[TRAIN]   Stations       : {df['STATION_ID'].nunique()}")
 
@@ -217,6 +255,21 @@ def main() -> None:
         and pd.api.types.is_numeric_dtype(df[c])
     ])
     print(f"[TRAIN]   Features       : {len(feature_cols)}")
+
+    n_train_before_features = len(train_df)
+    n_test_before_features = len(test_df)
+    train_df = train_df.dropna(subset=feature_cols).reset_index(drop=True)
+    test_df = test_df.dropna(subset=feature_cols).reset_index(drop=True)
+    dropped_feature_rows = (
+        n_train_before_features - len(train_df)
+        + n_test_before_features - len(test_df)
+    )
+    if dropped_feature_rows:
+        print(f"[TRAIN]   Dropped NaN feature rows: {dropped_feature_rows:,}")
+    if train_df.empty or test_df.empty:
+        print("[TRAIN] Train/test split became empty after dropping NaN features.")
+        print("[TRAIN] Need more complete data before training.")
+        sys.exit(0)
 
     X_train = train_df[feature_cols].to_numpy()
     y_train = train_df[target_cols].to_numpy()
@@ -262,28 +315,30 @@ def main() -> None:
     }
 
     # 8. Persist artefacts
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    joblib.dump(rf, MODEL_PATH)
-    FEATURE_COLS_PATH.write_text(json.dumps({
+    models_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump(rf, model_path)
+    feature_cols_path.write_text(json.dumps({
         "feature_columns": feature_cols,
         "target_columns":  target_cols,
         "horizons":        FORECAST_HORIZONS,
+        "source_features": str(features_path),
+        "history_preview": bool(args.history_preview),
     }, indent=2))
-    EVAL_REPORT_PATH.write_text(json.dumps(rf_report, indent=2))
-    BASELINE_PATH.write_text(json.dumps({
+    eval_report_path.write_text(json.dumps(rf_report, indent=2))
+    baseline_path.write_text(json.dumps({
         "persistence":       persistence_report,
         "linear_regression": linear_report,
     }, indent=2))
-    SHAP_REPORT_PATH.write_text(json.dumps(shap_report, indent=2))
+    shap_report_path.write_text(json.dumps(shap_report, indent=2))
 
     # 9. Summary
     print()
     print("[TRAIN] Done. Artefacts:")
-    print(f"[TRAIN]   {MODEL_PATH}")
-    print(f"[TRAIN]   {FEATURE_COLS_PATH}")
-    print(f"[TRAIN]   {EVAL_REPORT_PATH}")
-    print(f"[TRAIN]   {BASELINE_PATH}")
-    print(f"[TRAIN]   {SHAP_REPORT_PATH}")
+    print(f"[TRAIN]   {model_path}")
+    print(f"[TRAIN]   {feature_cols_path}")
+    print(f"[TRAIN]   {eval_report_path}")
+    print(f"[TRAIN]   {baseline_path}")
+    print(f"[TRAIN]   {shap_report_path}")
     print()
     print("[TRAIN] Top 5 features (by mean |SHAP value|, t+1h horizon):")
     for entry in shap_report["ranking"][:5]:

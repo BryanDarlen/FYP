@@ -20,6 +20,7 @@ Run as a script to materialise data/processed/features.csv:
 """
 
 import sys
+import argparse
 from pathlib import Path
 
 import pandas as pd
@@ -28,8 +29,10 @@ import pandas as pd
 # --- Paths -------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-TIMESERIES_PATH = PROJECT_ROOT / "data" / "processed" / "merged_timeseries.csv"
-FEATURES_PATH   = PROJECT_ROOT / "data" / "processed" / "features.csv"
+TIMESERIES_PATH        = PROJECT_ROOT / "data" / "processed" / "merged_timeseries.csv"
+FEATURES_PATH          = PROJECT_ROOT / "data" / "processed" / "features.csv"
+HISTORY_PREVIEW_PATH   = PROJECT_ROOT / "data" / "processed" / "multisource_history_preview.csv"
+PREVIEW_FEATURES_PATH  = PROJECT_ROOT / "data" / "processed" / "features_history_preview.csv"
 
 
 # --- Feature column lists (single source of truth) ---------------------------
@@ -118,13 +121,39 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 # --- CLI entry point: training-time materialisation --------------------------
 
 def main() -> None:
-    if not TIMESERIES_PATH.exists():
-        print(f"[FE] No data to process - {TIMESERIES_PATH} not found.")
+    parser = argparse.ArgumentParser(description="Build engineered API forecasting features.")
+    parser.add_argument(
+        "--input",
+        default=str(TIMESERIES_PATH),
+        help="Input merged CSV. Defaults to scheduler-collected merged_timeseries.csv.",
+    )
+    parser.add_argument(
+        "--output",
+        default=str(FEATURES_PATH),
+        help="Output features CSV. Defaults to data/processed/features.csv.",
+    )
+    parser.add_argument(
+        "--history-preview",
+        action="store_true",
+        help=(
+            "Use the controlled historical preview input and write a separate "
+            "features_history_preview.csv file."
+        ),
+    )
+    args = parser.parse_args()
+
+    input_path = HISTORY_PREVIEW_PATH if args.history_preview else Path(args.input)
+    output_path = PREVIEW_FEATURES_PATH if args.history_preview else Path(args.output)
+
+    if not input_path.exists():
+        print(f"[FE] No data to process - {input_path} not found.")
         print("[FE] Start the scheduler first: python src/pipeline/scheduler.py")
+        print("[FE] Or build the historical preview first:")
+        print('[FE]   python src/pipeline/pipeline_merge.py --history-preview --datetime "YYYY-MM-DD HH:00"')
         sys.exit(0)
 
-    print(f"[FE] Loading {TIMESERIES_PATH.name} ...")
-    df = pd.read_csv(TIMESERIES_PATH, parse_dates=["HOUR_MYT"])
+    print(f"[FE] Loading {input_path.name} ...")
+    df = pd.read_csv(input_path, parse_dates=["HOUR_MYT"])
     n_in        = len(df)
     n_stations  = df["STATION_ID"].nunique()
     hour_min    = df["HOUR_MYT"].min()
@@ -133,6 +162,10 @@ def main() -> None:
     print(f"[FE]   Rows           : {n_in:,}")
     print(f"[FE]   Unique stations: {n_stations}")
     print(f"[FE]   Hour range     : {hour_min}  ..  {hour_max}  ({span_hours} hours)")
+    if "DATA_FLAG" in df.columns:
+        backfilled = df["DATA_FLAG"].fillna("").astype(str).str.contains("BACKFILLED_PREVIEW").sum()
+        if backfilled:
+            print(f"[FE]   Backfilled rows: {backfilled:,}  (controlled historical preview)")
 
     print("[FE] Building features ...")
     feats = build_features(df)
@@ -145,14 +178,14 @@ def main() -> None:
         print("[FE] valid API_lag24h. Keep the scheduler running and re-run this.")
         sys.exit(0)
 
-    FEATURES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    feats.to_csv(FEATURES_PATH, index=False)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    feats.to_csv(output_path, index=False)
 
     new_cols = LAG_COLS + ROLL_COLS + TIME_COLS + INTERACT_COLS + QUALITY_COLS
     print(f"[FE]   Output rows    : {n_out:,}  (dropped {n_in - n_out:,} early-history/gap rows)")
     print(f"[FE]   Total columns  : {len(feats.columns)}  (added {len(new_cols)} engineered)")
     print(f"[FE]   New features   : {', '.join(new_cols)}")
-    print(f"[FE]   Saved to       : {FEATURES_PATH}")
+    print(f"[FE]   Saved to       : {output_path}")
 
 
 if __name__ == "__main__":
